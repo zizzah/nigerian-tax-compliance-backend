@@ -1,0 +1,422 @@
+# ============================================================================
+# NIGERIAN TAX COMPLIANCE BACKEND - .gitignore
+# ============================================================================
+
+# ============================================================================
+# Python
+# ============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+*.c
+*.cpp
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff (if used):
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff (if used):
+instance/
+.webassets-cache
+
+# Scrapy stuff (if used):
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.env.local
+.env.*.local
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# ============================================================================
+# PROJECT SPECIFIC
+# ============================================================================
+
+# Environment variables
+.env
+.env.local
+.env.production
+.env.staging
+.env.test
+.env.development
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+db_backup/
+
+# Logs
+logs/
+*.log
+log/
+*.log.*
+
+# Uploaded files
+uploads/
+uploads/*
+!uploads/.gitkeep
+temp/
+temp/*
+!temp/.gitkeep
+receipts/
+receipts/*
+!receipts/.gitkeep
+
+# Generated PDFs
+generated_pdfs/
+*.pdf
+
+# AI Model files (if downloaded locally)
+models/
+*.bin
+*.h5
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# OCR temporary files
+ocr_temp/
+*.tiff
+*.tif
+
+# ============================================================================
+# IDE & EDITORS
+# ============================================================================
+
+# VSCode
+.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+*.vsix
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+*~
+tags
+[._]*.un~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ============================================================================
+# OPERATING SYSTEMS
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================================
+# CLOUD & DEPLOYMENT
+# ============================================================================
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+*.tfvars
+
+# AWS
+.aws/
+
+# Google Cloud
+.gcp/
+gcloud-credentials.json
+
+# Azure
+.azure/
+
+# ============================================================================
+# SECURITY & SECRETS
+# ============================================================================
+
+# Secrets
+secrets/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# API Keys
+api_keys.txt
+credentials.json
+service-account.json
+
+# SSH Keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# GPG Keys
+*.gpg
+secring.*
+
+# ============================================================================
+# DEPENDENCIES & BUILD
+# ============================================================================
+
+# Node modules (if using any JS tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+# Test databases
+test_*.db
+test_*.sqlite
+*_test.db
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ============================================================================
+# MISC
+# ============================================================================
+
+# Backup files
+*.bak
+*.swp
+*.swo
+*~
+*.orig
+
+# Compressed files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Temporary files
+tmp/
+*.tmp
+*.temp
+
+# Cache
+.cache/
+*.cache
+
+# ============================================================================
+# KEEP THESE DIRECTORIES (but ignore contents)
+# ============================================================================
+
+# Keep directory structure but ignore files inside
+uploads/*
+!uploads/.gitkeep
+
+temp/*
+!temp/.gitkeep
+
+logs/*
+!logs/.gitkeep
+
+receipts/*
+!receipts/.gitkeep
