@@ -15,8 +15,7 @@ import uuid
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.user import User
-
+from app.models import User # type: ignore
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
