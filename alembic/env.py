@@ -6,7 +6,10 @@ from app.core.config import settings
 from app.core.database import Base
 
 # THIS IS CRITICAL - Import all models here so Alembic can detect them
-from app.models import User
+# Add these imports at the top
+from app.models.user import User
+from app.models.business import Business
+from app.models.customer import Customer
 
 config = context.config
 

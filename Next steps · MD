@@ -1,0 +1,461 @@
+# 🚀 NEXT STEPS - Week 1 Completion & Week 2 Start
+
+## ✅ What You've Completed (Week 1)
+
+- [x] Database setup with PostgreSQL
+- [x] Users table created and migrated
+- [x] Authentication system working
+  - [x] Registration endpoint
+  - [x] Login endpoint (JWT)
+  - [x] Password hashing
+  - [x] Account locking
+  - [x] Email verification structure
+  - [x] Password reset structure
+- [x] Protected routes with JWT
+- [x] Admin user created
+- [x] Test users seeded
+- [x] API documentation at /docs
+
+**Status:** Week 1 = 100% COMPLETE ✅
+
+---
+
+## 🎯 NEXT: Week 2 - Business Profiles (Days 6-10)
+
+### **Day 6: Business Model & Migration**
+
+#### 1. Create Business Model
+**File:** `app/models/business.py`
+
+```python
+from sqlalchemy import Column, String, Boolean, Integer, DateTime, Numeric, Enum
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+import uuid
+from datetime import datetime
+from app.core.database import Base
+import enum
+
+class SubscriptionTier(str, enum.Enum):
+    FREE = "FREE"
+    BASIC = "BASIC"
+    PROFESSIONAL = "PROFESSIONAL"
+    ENTERPRISE = "ENTERPRISE"
+
+class Business(Base):
+    __tablename__ = "businesses"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=False)
+    
+    # Business Info
+    business_name = Column(String(255), nullable=False)
+    business_type = Column(String(100))
+    industry = Column(String(100))
+    
+    # Tax Info
+    tin = Column(String(20), unique=True)
+    vat_registered = Column(Boolean, default=False)
+    vat_number = Column(String(20))
+    rc_number = Column(String(20))
+    
+    # Contact
+    address = Column(String)
+    city = Column(String(100))
+    state = Column(String(50))
+    country = Column(String(50), default="Nigeria")
+    phone = Column(String(20))
+    email = Column(String(255))
+    website = Column(String(255))
+    
+    # Branding
+    logo_url = Column(String)
+    primary_color = Column(String(7), default="#3B82F6")
+    secondary_color = Column(String(7), default="#10B981")
+    
+    # Invoice Settings
+    invoice_prefix = Column(String(10), default="INV")
+    invoice_counter = Column(Integer, default=1)
+    
+    # Subscription
+    subscription_tier = Column(Enum(SubscriptionTier), default=SubscriptionTier.FREE)
+    monthly_invoice_quota = Column(Integer, default=10)
+    monthly_document_quota = Column(Integer, default=20)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+```
+
+#### 2. Update User Model
+Add to `app/models/user.py`:
+```python
+# Add this relationship
+businesses = relationship("Business", back_populates="user", cascade="all, delete-orphan")
+```
+
+#### 3. Create Migration
+```bash
+alembic revision --autogenerate -m "Add businesses table"
+alembic upgrade head
+```
+
+---
+
+### **Day 7: Business Schemas & Endpoints**
+
+#### 1. Create Schemas
+**File:** `app/schemas/business.py`
+
+```python
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
+import uuid
+from datetime import datetime
+
+class BusinessCreate(BaseModel):
+    business_name: str = Field(..., min_length=2, max_length=255)
+    business_type: Optional[str] = None
+    industry: Optional[str] = None
+    tin: Optional[str] = None
+    vat_registered: bool = False
+    vat_number: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+
+class BusinessUpdate(BaseModel):
+    business_name: Optional[str] = None
+    business_type: Optional[str] = None
+    industry: Optional[str] = None
+    tin: Optional[str] = None
+    vat_registered: Optional[bool] = None
+    vat_number: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    website: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    logo_url: Optional[str] = None
+    invoice_prefix: Optional[str] = None
+
+class BusinessResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    business_name: str
+    business_type: Optional[str]
+    industry: Optional[str]
+    tin: Optional[str]
+    vat_registered: bool
+    vat_number: Optional[str]
+    rc_number: Optional[str]
+    phone: Optional[str]
+    email: Optional[str]
+    website: Optional[str]
+    address: Optional[str]
+    city: Optional[str]
+    state: Optional[str]
+    logo_url: Optional[str]
+    invoice_prefix: str
+    invoice_counter: int
+    subscription_tier: str
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+```
+
+#### 2. Create Business Endpoints
+**File:** `app/api/v1/endpoints/businesses.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.core.dependencies import get_current_user
+from app.models.user import User
+from app.models.business import Business
+from app.schemas.business import BusinessCreate, BusinessUpdate, BusinessResponse
+
+router = APIRouter(prefix="/businesses", tags=["Businesses"])
+
+@router.post("/", response_model=BusinessResponse, status_code=status.HTTP_201_CREATED)
+async def create_business(
+    business_data: BusinessCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create business profile"""
+    # Check if user already has a business
+    existing = db.query(Business).filter(Business.user_id == current_user.id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Business already exists")
+    
+    business = Business(**business_data.dict(), user_id=current_user.id)
+    db.add(business)
+    db.commit()
+    db.refresh(business)
+    return business
+
+@router.get("/me", response_model=BusinessResponse)
+async def get_my_business(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current user's business"""
+    business = db.query(Business).filter(Business.user_id == current_user.id).first()
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    return business
+
+@router.patch("/me", response_model=BusinessResponse)
+async def update_my_business(
+    business_data: BusinessUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update current user's business"""
+    business = db.query(Business).filter(Business.user_id == current_user.id).first()
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    
+    for key, value in business_data.dict(exclude_unset=True).items():
+        setattr(business, key, value)
+    
+    db.commit()
+    db.refresh(business)
+    return business
+```
+
+#### 3. Add Router to main.py
+```python
+from app.api.v1.endpoints import businesses
+
+app.include_router(businesses.router, prefix=settings.API_V1_PREFIX)
+```
+
+---
+
+### **Day 8: Test Business Endpoints**
+
+#### Test at http://localhost:8000/docs
+
+**1. Create Business:**
+```json
+{
+  "business_name": "TechCorp Nigeria Ltd",
+  "business_type": "Limited Liability Company",
+  "industry": "Technology",
+  "tin": "12345678-0001",
+  "vat_registered": true,
+  "vat_number": "VAT-12345678",
+  "phone": "+2348012345678",
+  "email": "info@techcorp.ng",
+  "address": "123 Lagos Street",
+  "city": "Lagos",
+  "state": "Lagos"
+}
+```
+
+**2. Get Business:**
+```
+GET /api/v1/businesses/me
+```
+
+**3. Update Business:**
+```json
+{
+  "website": "https://techcorp.ng",
+  "invoice_prefix": "TC"
+}
+```
+
+---
+
+### **Day 9: Customer Model**
+
+**File:** `app/models/customer.py`
+
+```python
+from sqlalchemy import Column, String, Integer, Date, Numeric, Boolean, DateTime
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
+from datetime import datetime
+from app.core.database import Base
+
+class Customer(Base):
+    __tablename__ = "customers"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    business_id = Column(UUID(as_uuid=True), nullable=False)
+    
+    # Basic Info
+    name = Column(String(255), nullable=False)
+    email = Column(String(255))
+    phone = Column(String(20))
+    
+    # Address
+    address = Column(String)
+    city = Column(String(100))
+    state = Column(String(50))
+    country = Column(String(50), default="Nigeria")
+    
+    # Tax
+    tin = Column(String(20))
+    
+    # Analytics (auto-calculated)
+    total_invoices_count = Column(Integer, default=0)
+    total_invoiced_amount = Column(Numeric(15, 2), default=0)
+    total_paid_amount = Column(Numeric(15, 2), default=0)
+    average_payment_days = Column(Integer)
+    last_invoice_date = Column(Date)
+    
+    # Settings
+    customer_type = Column(String(50), default="Individual")
+    credit_limit = Column(Numeric(15, 2))
+    payment_terms_days = Column(Integer, default=30)
+    is_active = Column(Boolean, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+```
+
+**Create Migration:**
+```bash
+alembic revision --autogenerate -m "Add customers table"
+alembic upgrade head
+```
+
+---
+
+### **Day 10: Customer Endpoints**
+
+**File:** `app/api/v1/endpoints/customers.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from typing import List
+from app.core.database import get_db
+from app.core.dependencies import get_current_user
+from app.models.user import User
+from app.models.business import Business
+from app.models.customer import Customer
+
+router = APIRouter(prefix="/customers", tags=["Customers"])
+
+@router.post("/", status_code=201)
+async def create_customer(
+    customer_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create customer"""
+    business = db.query(Business).filter(Business.user_id == current_user.id).first()
+    if not business:
+        raise HTTPException(status_code=400, detail="Create business first")
+    
+    customer = Customer(**customer_data, business_id=business.id)
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+@router.get("/")
+async def list_customers(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List customers with pagination"""
+    business = db.query(Business).filter(Business.user_id == current_user.id).first()
+    if not business:
+        return []
+    
+    customers = db.query(Customer)\
+        .filter(Customer.business_id == business.id)\
+        .offset(skip)\
+        .limit(limit)\
+        .all()
+    return customers
+
+@router.get("/{customer_id}")
+async def get_customer(
+    customer_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get customer by ID"""
+    business = db.query(Business).filter(Business.user_id == current_user.id).first()
+    customer = db.query(Customer)\
+        .filter(Customer.id == customer_id, Customer.business_id == business.id)\
+        .first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return customer
+```
+
+---
+
+## 📊 Week 2 Summary
+
+By end of Week 2, you'll have:
+- ✅ Business profiles (create, read, update)
+- ✅ Customer management (CRUD + pagination)
+- ✅ Multi-table relationships working
+- ✅ Business-scoped data (users see only their data)
+
+**Total Tables:** 3 (users, businesses, customers)
+**Total Endpoints:** ~15
+**Lines of Code:** ~2,000
+
+---
+
+## 🗓️ Week 3 Preview: Invoicing (Days 11-15)
+
+- Day 11-12: Invoice & InvoiceItem models
+- Day 13: Product catalog
+- Day 14: Invoice PDF generation
+- Day 15: Payment tracking
+
+---
+
+## ✅ Success Checklist (Week 2)
+
+- [ ] Business model created and migrated
+- [ ] Can create business profile
+- [ ] Can update business settings
+- [ ] Customer model created and migrated
+- [ ] Can add customers
+- [ ] Can list customers with pagination
+- [ ] Can view customer details
+- [ ] Business-customer relationship working
+- [ ] All endpoints tested in /docs
+
+---
+
+## 🚀 Quick Commands
+
+```bash
+# Day 6
+alembic revision --autogenerate -m "Add businesses table"
+alembic upgrade head
+
+# Day 9
+alembic revision --autogenerate -m "Add customers table"
+alembic upgrade head
+
+# Test
+uvicorn app.main:app --reload
+# Visit http://localhost:8000/docs
+```
+
+---
+
+**Start with Day 6 - Business Model! 🎯**
