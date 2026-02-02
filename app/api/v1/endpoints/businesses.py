@@ -14,7 +14,7 @@ from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.models.business import Business
 from app.schemas.business import (
-    BusinessCreate,
+    BusinessCreate, # type: ignore
     BusinessUpdate,
     BusinessResponse,
     BusinessSummary

@@ -2,7 +2,7 @@
 Business Pydantic Schemas
 Location: app/schemas/business.py
 """
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
 import uuid
 from datetime import datetime
@@ -31,7 +31,8 @@ class BusinessCreate(BaseModel):
     city: Optional[str] = Field(None, max_length=100)
     state: Optional[str] = Field(None, max_length=50)
     
-    @validator('tin')
+    @field_validator('tin')
+    @classmethod
     def validate_tin(cls, v):
         """Validate TIN format (basic check)"""
         if v and len(v) < 8:
@@ -61,8 +62,8 @@ class BusinessUpdate(BaseModel):
     
     # Branding
     logo_url: Optional[str] = None
-    primary_color: Optional[str] = Field(None, regex=r'^#[0-9A-Fa-f]{6}$') # type: ignore
-    secondary_color: Optional[str] = Field(None, regex=r'^#[0-9A-Fa-f]{6}$') # type: ignore
+    primary_color: Optional[str] = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
+    secondary_color: Optional[str] = Field(None, pattern=r'^#[0-9A-Fa-f]{6}$')
     
     # Invoice Settings
     invoice_prefix: Optional[str] = Field(None, min_length=1, max_length=10)
