@@ -10,6 +10,11 @@ from app.core.database import Base
 from app.models.user import User
 from app.models.business import Business
 from app.models.customer import Customer
+# Add these imports with existing ones
+from app.models.product import Product
+from app.models.invoice import Invoice
+from app.models.invoice_item import InvoiceItem
+from app.models.payment import Payment
 
 config = context.config
 

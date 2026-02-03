@@ -5,7 +5,15 @@ Location: app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.v1.endpoints import auth, users, businesses, customers
+from app.api.v1.endpoints import (
+    auth, 
+    users, 
+    businesses, 
+    customers, 
+    invoices, 
+    products, 
+    payments
+)
 
 
 # Import routers (we'll create these files)
@@ -54,6 +62,10 @@ app.include_router(users.router, prefix=settings.API_V1_PREFIX)
 # Add to routers
 app.include_router(businesses.router, prefix=settings.API_V1_PREFIX)
 app.include_router(customers.router, prefix=settings.API_V1_PREFIX)
+
+app.include_router(invoices.router, prefix=settings.API_V1_PREFIX)
+app.include_router(products.router, prefix=settings.API_V1_PREFIX)
+app.include_router(payments.router, prefix=settings.API_V1_PREFIX)
 # ============================================================================
 # Include Routers (Add these as you create the endpoint files)
 # ============================================================================
