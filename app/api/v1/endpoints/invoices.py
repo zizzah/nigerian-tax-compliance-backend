@@ -1,14 +1,23 @@
 """
-Invoice API Endpoints
+IMPROVED Invoice API Endpoints with Better Error Handling
 Location: app/api/v1/endpoints/invoices.py
+
+Key Improvements:
+1. Handles duplicate invoice numbers automatically
+2. Better transaction management (rollback on error)
+3. Retry logic for counter conflicts
+4. Better error messages
+5. Validates customer belongs to business before starting
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, func
+from sqlalchemy.exc import IntegrityError
 from typing import Optional
 import uuid
 import math
 from datetime import date, datetime, timedelta
+import time
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -63,8 +72,45 @@ def verify_customer_belongs_to_business(db: Session, customer_id: uuid.UUID, bus
     return customer
 
 
+def generate_unique_invoice_number(db: Session, business: Business, max_retries: int = 5) -> str:
+    """
+    Generate a unique invoice number with retry logic
+    
+    This handles the edge case where:
+    1. Two requests try to create invoices simultaneously
+    2. Counter is out of sync with database
+    3. Failed transaction didn't increment counter
+    """
+    for attempt in range(max_retries):
+        # Get the invoice number
+        invoice_number = business.get_next_invoice_number()
+        
+        # Check if it already exists
+        existing = db.query(Invoice).filter(
+            Invoice.invoice_number == invoice_number
+        ).first()
+        
+        if not existing:
+            # Great! This number is available
+            return invoice_number
+        
+        # Number exists - increment counter and try again
+        print(f"⚠️  Invoice number {invoice_number} already exists (attempt {attempt + 1}/{max_retries})")
+        business.invoice_counter += 1
+        
+        # Small delay to avoid race conditions
+        if attempt < max_retries - 1:
+            time.sleep(0.1)
+    
+    # If we get here, we failed to generate a unique number
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Failed to generate unique invoice number after {max_retries} attempts. Please try again."
+    )
+
+
 # ============================================================================
-# Invoice CRUD Endpoints
+# IMPROVED Invoice CRUD Endpoints
 # ============================================================================
 
 @router.post("/", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
@@ -74,7 +120,14 @@ async def create_invoice(
     db: Session = Depends(get_db)
 ):
     """
-    Create a new invoice
+    Create a new invoice with improved error handling
+    
+    **Improvements:**
+    - Automatically handles duplicate invoice numbers
+    - Better transaction management
+    - Validates all relationships before starting
+    - Rolls back on any error
+    - Clear error messages
     
     **Required:**
     - **customer_id**: Customer UUID
@@ -89,70 +142,136 @@ async def create_invoice(
     - **internal_notes**: Internal notes (not visible to customer)
     
     **Auto-calculated:**
-    - Invoice number (e.g., INV-00001)
+    - Invoice number (e.g., INV-00001) - with duplicate detection
     - Subtotal, tax, and total amounts
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    # Verify customer
-    customer = verify_customer_belongs_to_business(db, invoice_data.customer_id, business.id) # type: ignore
-    
-    # Generate invoice number
-    invoice_number = business.get_next_invoice_number()
-    
-    # Create invoice
-    invoice = Invoice(
-        business_id=business.id,
-        customer_id=customer.id,
-        invoice_number=invoice_number,
-        issue_date=invoice_data.issue_date,
-        due_date=invoice_data.due_date,
-        discount_amount=invoice_data.discount_amount,
-        payment_terms=invoice_data.payment_terms or f"Payment due within {customer.payment_terms_days} days",
-        notes=invoice_data.notes,
-        internal_notes=invoice_data.internal_notes,
-        status=InvoiceStatus.DRAFT
-    )
-    
-    db.add(invoice)
-    db.flush()  # Get invoice ID
-    
-    # Create invoice items
-    for idx, item_data in enumerate(invoice_data.items):
-        item = InvoiceItem(
-            invoice_id=invoice.id,
-            product_id=item_data.product_id,
-            description=item_data.description,
-            quantity=item_data.quantity,
-            unit_price=item_data.unit_price,
-            discount_percent=item_data.discount_percent,
-            tax_rate=item_data.tax_rate,
-            sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
+    try:
+        # Step 1: Get and validate business
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        # Step 2: Verify customer BEFORE starting transaction
+        customer = verify_customer_belongs_to_business(db, invoice_data.customer_id, business.id) # type: ignore
+        
+        # Step 3: Generate unique invoice number (with retry logic)
+        invoice_number = generate_unique_invoice_number(db, business)
+        
+        # Step 4: Create invoice object
+        invoice = Invoice(
+            business_id=business.id,
+            customer_id=customer.id,
+            invoice_number=invoice_number,
+            issue_date=invoice_data.issue_date,
+            due_date=invoice_data.due_date,
+            discount_amount=invoice_data.discount_amount,
+            payment_terms=invoice_data.payment_terms or f"Payment due within {customer.payment_terms_days} days",
+            notes=invoice_data.notes,
+            internal_notes=invoice_data.internal_notes,
+            status=InvoiceStatus.DRAFT
         )
         
-        # Calculate item totals
-        item.calculate_totals()
+        db.add(invoice)
         
-        db.add(item)
+        # Step 5: Flush to get invoice ID (but don't commit yet)
+        try:
+            db.flush()
+        except IntegrityError as e:
+            # This should rarely happen now with our retry logic
+            db.rollback()
+            if "ix_invoices_invoice_number" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Invoice number {invoice_number} already exists. Please try again."
+                )
+            raise
         
-        # Update product usage if product_id provided
-        if item_data.product_id:
-            product = db.query(Product).filter(Product.id == item_data.product_id).first()
-            if product:
-                product.increment_usage()
+        # Step 6: Create invoice items
+        for idx, item_data in enumerate(invoice_data.items):
+            item = InvoiceItem(
+                invoice_id=invoice.id,
+                product_id=item_data.product_id,
+                description=item_data.description,
+                quantity=item_data.quantity,
+                unit_price=item_data.unit_price,
+                discount_percent=item_data.discount_percent,
+                tax_rate=item_data.tax_rate,
+                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
+            )
+            
+            # Calculate item totals
+            item.calculate_totals()
+            db.add(item)
+            
+            # Step 7: Update product usage if product_id provided
+            if item_data.product_id:
+                product = db.query(Product).filter(Product.id == item_data.product_id).first()
+                if product:
+                    product.increment_usage()
+        
+        # Step 8: Flush items to ensure they're saved
+        db.flush()
+        
+        # Step 9: Refresh invoice to load items relationship
+        db.refresh(invoice)
+        
+        # Step 10: Calculate invoice totals
+        invoice.calculate_totals()
+        
+        # Step 11: Increment business invoice counter
+        business.increment_invoice_counter()
+        
+        # Step 12: Commit everything (all or nothing)
+        db.commit()
+        
+        # Step 13: Final refresh to get updated data
+        db.refresh(invoice)
+        
+        return invoice
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (they're already properly formatted)
+        db.rollback()
+        raise
+        
+    except IntegrityError as e:
+        db.rollback()
+        
+        # Handle specific integrity errors with helpful messages
+        error_msg = str(e.orig) if hasattr(e, 'orig') else str(e)
+        
+        if "ix_invoices_invoice_number" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Invoice number conflict. Please try again."
+            )
+        elif "fk_invoices_customer_id" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid customer ID"
+            )
+        elif "fk_invoices_business_id" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid business ID"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Database integrity error: {error_msg}"
+            )
     
-    # Calculate invoice totals
-    db.flush()  # Ensure items are saved
-    db.refresh(invoice)
-    invoice.calculate_totals()
-    
-    # Increment business invoice counter
-    business.increment_invoice_counter()
-    
-    db.commit()
-    db.refresh(invoice)
-    
-    return invoice
+    except Exception as e:
+        # Rollback on any other error
+        db.rollback()
+        
+        # Log the error (in production, use proper logging)
+        print(f"❌ Error creating invoice: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create invoice: {str(e)}"
+        )
 
 
 @router.get("/", response_model=InvoiceListResponse)
@@ -298,78 +417,92 @@ async def update_invoice(
     db: Session = Depends(get_db)
 ):
     """
-    Update an invoice
+    Update an invoice with improved error handling
     
     **Note:** Only DRAFT invoices can be fully updated.
     SENT invoices can only update notes and payment terms.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
-    
-    if not invoice:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invoice not found"
-        )
-    
-    # Check if invoice can be edited
-    if invoice.status not in [InvoiceStatus.DRAFT]:
-        # Only allow updating notes and payment terms for sent invoices
-        allowed_fields = {'payment_terms', 'notes', 'internal_notes'}
-        update_data = invoice_data.model_dump(exclude_unset=True)
-        if not set(update_data.keys()).issubset(allowed_fields):
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        invoice = db.query(Invoice).filter(
+            Invoice.id == invoice_id,
+            Invoice.business_id == business.id
+        ).first()
+        
+        if not invoice:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only draft invoices can be fully edited. Sent invoices can only update payment_terms, notes, and internal_notes."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invoice not found"
             )
-    
-    # Update fields
-    update_data = invoice_data.model_dump(exclude_unset=True)
-    
-    # Handle customer change
-    if 'customer_id' in update_data:
-        verify_customer_belongs_to_business(db, update_data['customer_id'], business.id) # type: ignore
-    
-    # Handle items update
-    if 'items' in update_data and update_data['items']:
-        # Delete existing items
-        db.query(InvoiceItem).filter(InvoiceItem.invoice_id == invoice.id).delete()
         
-        # Create new items
-        for idx, item_data in enumerate(update_data['items']):
-            item = InvoiceItem(
-                invoice_id=invoice.id,
-                product_id=item_data.product_id,
-                description=item_data.description,
-                quantity=item_data.quantity,
-                unit_price=item_data.unit_price,
-                discount_percent=item_data.discount_percent,
-                tax_rate=item_data.tax_rate,
-                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
-            )
-            item.calculate_totals()
-            db.add(item)
+        # Check if invoice can be edited
+        if invoice.status not in [InvoiceStatus.DRAFT]:
+            # Only allow updating notes and payment terms for sent invoices
+            allowed_fields = {'payment_terms', 'notes', 'internal_notes'}
+            update_data = invoice_data.model_dump(exclude_unset=True)
+            if not set(update_data.keys()).issubset(allowed_fields):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Only draft invoices can be fully edited. Sent invoices can only update payment_terms, notes, and internal_notes."
+                )
         
-        del update_data['items']
-    
-    # Update invoice fields
-    for field, value in update_data.items():
-        setattr(invoice, field, value)
-    
-    # Recalculate totals if items were updated
-    if 'items' in invoice_data.model_dump(exclude_unset=True):
-        db.flush()
+        # Update fields
+        update_data = invoice_data.model_dump(exclude_unset=True)
+        
+        # Handle customer change
+        if 'customer_id' in update_data:
+            verify_customer_belongs_to_business(db, update_data['customer_id'], business.id) # type: ignore
+        
+        # Handle items update
+        if 'items' in update_data and update_data['items']:
+            # Delete existing items
+            db.query(InvoiceItem).filter(InvoiceItem.invoice_id == invoice.id).delete()
+            
+            # Create new items
+            for idx, item_data in enumerate(update_data['items']):
+                item = InvoiceItem(
+                    invoice_id=invoice.id,
+                    product_id=item_data.product_id,
+                    description=item_data.description,
+                    quantity=item_data.quantity,
+                    unit_price=item_data.unit_price,
+                    discount_percent=item_data.discount_percent,
+                    tax_rate=item_data.tax_rate,
+                    sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
+                )
+                item.calculate_totals()
+                db.add(item)
+            
+            del update_data['items']
+        
+        # Update invoice fields
+        for field, value in update_data.items():
+            setattr(invoice, field, value)
+        
+        # Recalculate totals if items were updated
+        if 'items' in invoice_data.model_dump(exclude_unset=True):
+            db.flush()
+            db.refresh(invoice)
+            invoice.calculate_totals()
+        
+        db.commit()
         db.refresh(invoice)
-        invoice.calculate_totals()
-    
-    db.commit()
-    db.refresh(invoice)
-    
-    return invoice
+        
+        return invoice
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error updating invoice: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update invoice: {str(e)}"
+        )
 
 
 @router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -383,30 +516,41 @@ async def delete_invoice(
     
     **Note:** Only DRAFT invoices can be deleted.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
-    
-    if not invoice:
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        invoice = db.query(Invoice).filter(
+            Invoice.id == invoice_id,
+            Invoice.business_id == business.id
+        ).first()
+        
+        if not invoice:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invoice not found"
+            )
+        
+        # Only allow deleting draft invoices
+        if invoice.status != InvoiceStatus.DRAFT: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only draft invoices can be deleted. Use cancel endpoint for sent invoices."
+            )
+        
+        db.delete(invoice)
+        db.commit()
+        
+        return None
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invoice not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete invoice: {str(e)}"
         )
-    
-    # Only allow deleting draft invoices
-    if invoice.status != InvoiceStatus.DRAFT: # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only draft invoices can be deleted. Use cancel endpoint for sent invoices."
-        )
-    
-    db.delete(invoice)
-    db.commit()
-    
-    return None
 
 
 # ============================================================================
@@ -424,30 +568,41 @@ async def finalize_invoice(
     
     This changes the status from DRAFT to SENT and records the sent timestamp.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
-    
-    if not invoice:
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        invoice = db.query(Invoice).filter(
+            Invoice.id == invoice_id,
+            Invoice.business_id == business.id
+        ).first()
+        
+        if not invoice:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invoice not found"
+            )
+        
+        if invoice.status != InvoiceStatus.DRAFT: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only draft invoices can be finalized"
+            )
+        
+        invoice.mark_as_sent()
+        db.commit()
+        db.refresh(invoice)
+        
+        return invoice
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invoice not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to finalize invoice: {str(e)}"
         )
-    
-    if invoice.status != InvoiceStatus.DRAFT: # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only draft invoices can be finalized"
-        )
-    
-    invoice.mark_as_sent()
-    db.commit()
-    db.refresh(invoice)
-    
-    return invoice
 
 
 @router.post("/{invoice_id}/cancel", response_model=InvoiceResponse)
@@ -462,41 +617,52 @@ async def cancel_invoice(
     
     Cancels the invoice and optionally records cancellation reason in internal notes.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
-    
-    if not invoice:
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        invoice = db.query(Invoice).filter(
+            Invoice.id == invoice_id,
+            Invoice.business_id == business.id
+        ).first()
+        
+        if not invoice:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invoice not found"
+            )
+        
+        if invoice.status == InvoiceStatus.PAID: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot cancel a paid invoice"
+            )
+        
+        if invoice.status == InvoiceStatus.CANCELLED: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invoice is already cancelled"
+            )
+        
+        # Add cancellation reason to internal notes
+        if cancel_data.reason:
+            cancellation_note = f"\n[CANCELLED - {datetime.now().strftime('%Y-%m-%d %H:%M')}]: {cancel_data.reason}"
+            invoice.internal_notes = (invoice.internal_notes or "") + cancellation_note # type: ignore
+        
+        invoice.mark_as_cancelled()
+        db.commit()
+        db.refresh(invoice)
+        
+        return invoice
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invoice not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cancel invoice: {str(e)}"
         )
-    
-    if invoice.status == InvoiceStatus.PAID: # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot cancel a paid invoice"
-        )
-    
-    if invoice.status == InvoiceStatus.CANCELLED: # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invoice is already cancelled"
-        )
-    
-    # Add cancellation reason to internal notes
-    if cancel_data.reason:
-        cancellation_note = f"\n[CANCELLED - {datetime.now().strftime('%Y-%m-%d %H:%M')}]: {cancel_data.reason}"
-        invoice.internal_notes = (invoice.internal_notes or "") + cancellation_note # type: ignore
-    
-    invoice.mark_as_cancelled()
-    db.commit()
-    db.refresh(invoice)
-    
-    return invoice
 
 
 # ============================================================================
