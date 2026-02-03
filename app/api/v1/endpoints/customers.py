@@ -10,7 +10,7 @@ import math
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.models.user import User
+from app.models.user import User # type: ignore
 from app.models.business import Business
 from app.models.customer import Customer
 from app.schemas.customer import (
