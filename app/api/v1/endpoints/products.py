@@ -1,20 +1,29 @@
 """
-Product API Endpoints
+Product API Endpoints - IMPROVED VERSION
 Location: app/api/v1/endpoints/products.py
+
+IMPROVEMENTS:
+1. Better error messages for duplicate SKU
+2. Optional SKU auto-generation
+3. Clearer validation errors
+4. Better handling of edge cases
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from typing import Optional
 import uuid
 import math
+import secrets
+import string
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.models.business import Business
 from app.models.product import Product
-from app.schemas.product import ( # type: ignore
+from app.schemas.product import (
     ProductCreate,
     ProductUpdate,
     ProductResponse,
@@ -40,6 +49,44 @@ def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
     return business
 
 
+def generate_unique_sku(db: Session, business_id: uuid.UUID, base_name: str = None) -> str: # type: ignore
+    """
+    Generate a unique SKU for a product
+    
+    Args:
+        db: Database session
+        business_id: Business ID
+        base_name: Optional base name to derive SKU from
+    
+    Returns:
+        Unique SKU string
+    """
+    max_attempts = 10
+    
+    for attempt in range(max_attempts):
+        if base_name:
+            # Create SKU from product name (first 3 chars + random suffix)
+            prefix = ''.join(c for c in base_name.upper() if c.isalnum())[:3]
+            random_suffix = ''.join(secrets.choice(string.digits) for _ in range(6))
+            sku = f"{prefix}-{random_suffix}"
+        else:
+            # Generate random SKU
+            random_code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+            sku = f"PRD-{random_code}"
+        
+        # Check if SKU already exists
+        existing = db.query(Product).filter(
+            Product.business_id == business_id,
+            Product.sku == sku
+        ).first()
+        
+        if not existing:
+            return sku
+    
+    # If we couldn't generate a unique SKU after max_attempts, use UUID
+    return f"PRD-{str(uuid.uuid4())[:8].upper()}"
+
+
 # ============================================================================
 # Product CRUD Endpoints
 # ============================================================================
@@ -59,7 +106,7 @@ async def create_product(
     
     **Optional:**
     - **description**: Product description
-    - **sku**: Stock Keeping Unit code
+    - **sku**: Stock Keeping Unit code (auto-generated if not provided)
     - **cost_price**: Cost price (for profit calculation)
     - **tax_rate**: Tax rate (default: 7.5% VAT)
     - **is_taxable**: Whether product is taxable (default: true)
@@ -70,7 +117,11 @@ async def create_product(
     """
     business = get_user_business(db, current_user.id) # type: ignore
     
-    # Check for duplicate SKU
+    # Auto-generate SKU if not provided
+    if not product_data.sku:
+        product_data.sku = generate_unique_sku(db, business.id, product_data.name) # type: ignore
+    
+    # Check for duplicate SKU (with better error message)
     if product_data.sku:
         existing = db.query(Product).filter(
             Product.business_id == business.id,
@@ -79,21 +130,66 @@ async def create_product(
         
         if existing:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Product with SKU '{product_data.sku}' already exists"
+                status_code=status.HTTP_409_CONFLICT,  # Changed from 400 to 409
+                detail={
+                    "error": "duplicate_sku",
+                    "message": f"A product with SKU '{product_data.sku}' already exists",
+                    "existing_product": {
+                        "id": str(existing.id),
+                        "name": existing.name,
+                        "sku": existing.sku
+                    },
+                    "suggestion": "Please use a different SKU or leave it blank to auto-generate"
+                }
             )
     
-    # Create product
-    product = Product(
-        **product_data.model_dump(),
-        business_id=business.id
-    )
+    # Validate inventory tracking requirements
+    if product_data.track_inventory and product_data.quantity_in_stock is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": "Quantity in stock is required when inventory tracking is enabled",
+                "field": "quantity_in_stock"
+            }
+        )
     
-    db.add(product)
-    db.commit()
-    db.refresh(product)
+    try:
+        # Create product
+        product = Product(
+            **product_data.model_dump(),
+            business_id=business.id
+        )
+        
+        db.add(product)
+        db.commit()
+        db.refresh(product)
+        
+        return product
     
-    return product
+    except IntegrityError as e:
+        db.rollback()
+        # Handle any database constraint violations
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "database_constraint_violation",
+                    "message": "A product with these details already exists",
+                    "suggestion": "Please check SKU or other unique fields"
+                }
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while creating the product"
+        )
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
 
 
 @router.get("/", response_model=ProductListResponse)
@@ -189,6 +285,41 @@ async def list_products_summary(
     return products
 
 
+@router.get("/check-sku/{sku}")
+async def check_sku_availability(
+    sku: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Check if a SKU is available for use
+    
+    Useful for validation before creating/updating products
+    """
+    business = get_user_business(db, current_user.id) # type: ignore
+    
+    existing = db.query(Product).filter(
+        Product.business_id == business.id,
+        Product.sku == sku
+    ).first()
+    
+    if existing:
+        return {
+            "available": False,
+            "sku": sku,
+            "existing_product": {
+                "id": str(existing.id),
+                "name": existing.name,
+                "is_active": existing.is_active
+            }
+        }
+    
+    return {
+        "available": True,
+        "sku": sku
+    }
+
+
 @router.get("/{product_id}", response_model=ProductResponse)
 async def get_product(
     product_id: uuid.UUID,
@@ -249,19 +380,46 @@ async def update_product(
         
         if existing:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Product with SKU '{product_data.sku}' already exists"
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "duplicate_sku",
+                    "message": f"Another product already uses SKU '{product_data.sku}'",
+                    "existing_product": {
+                        "id": str(existing.id),
+                        "name": existing.name
+                    }
+                }
             )
     
-    # Update fields
-    update_data = product_data.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(product, field, value)
+    # Validate inventory tracking if being enabled
+    if product_data.track_inventory and product_data.quantity_in_stock is None:
+        if not product.quantity_in_stock: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "validation_error",
+                    "message": "Quantity in stock must be set when enabling inventory tracking",
+                    "field": "quantity_in_stock"
+                }
+            )
     
-    db.commit()
-    db.refresh(product)
+    try:
+        # Update fields
+        update_data = product_data.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(product, field, value)
+        
+        db.commit()
+        db.refresh(product)
+        
+        return product
     
-    return product
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A conflict occurred while updating the product"
+        )
 
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -325,8 +483,11 @@ async def permanently_delete_product(
     if product.usage_count > 0: # type: ignore
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot delete product that has been used in {product.usage_count} invoice(s). "
-                   "Use soft delete instead."
+            detail={
+                "error": "product_in_use",
+                "message": f"Cannot delete product that has been used in {product.usage_count} invoice(s)",
+                "suggestion": "Use soft delete instead to preserve historical data"
+            }
         )
     
     db.delete(product)

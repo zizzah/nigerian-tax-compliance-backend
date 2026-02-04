@@ -1,8 +1,12 @@
 """
-Product Pydantic Schemas
+Product Pydantic Schemas - FIXED VERSION
 Location: app/schemas/product.py
+
+CHANGES:
+- Replaced @field_validator with @model_validator for inventory tracking validation
+- This fixes the timeout issue in test 1.2 "Create Product with Inventory Tracking"
 """
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 from decimal import Decimal
 from datetime import datetime
@@ -36,13 +40,12 @@ class ProductBase(BaseModel):
 class ProductCreate(ProductBase):
     """Schema for creating product"""
     
-    @field_validator('quantity_in_stock')
-    @classmethod
-    def validate_quantity(cls, v, info):
+    @model_validator(mode='after')
+    def validate_inventory_tracking(self):
         """Validate quantity is provided if tracking inventory"""
-        if info.data.get('track_inventory') and v is None:
-            raise ValueError('Quantity in stock required when tracking inventory')
-        return v
+        if self.track_inventory and self.quantity_in_stock is None:
+            raise ValueError('Quantity in stock is required when inventory tracking is enabled')
+        return self
 
 
 class ProductUpdate(BaseModel):
