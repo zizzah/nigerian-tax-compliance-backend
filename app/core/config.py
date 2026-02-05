@@ -3,6 +3,7 @@ Application Configuration
 Location: app/core/config.py
 """
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from typing import List, Optional
 
 
@@ -31,8 +32,30 @@ class Settings(BaseSettings):
     REQUIRE_PASSWORD_DIGIT: bool = True
     REQUIRE_PASSWORD_SPECIAL: bool = False
     
-    # External APIs
+    # ====================================================================
+    # AI API KEYS - Week 4 Addition
+    # ====================================================================
+    GROQ_API_KEY: str
     ANTHROPIC_API_KEY: Optional[str] = None
+    OPENAI_API_KEY: Optional[str] = None
+    
+    # ====================================================================
+    # REDIS & CELERY - Week 4 Addition
+    # ====================================================================
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+    
+    # ====================================================================
+    # FILE UPLOAD SETTINGS - Week 4 Addition
+    # ====================================================================
+    UPLOAD_DIR: str = "./uploads"
+    MAX_UPLOAD_SIZE_MB: int = 10
+    
+    # ====================================================================
+    # OCR SETTINGS - Week 4 Addition
+    # ====================================================================
+    TESSERACT_CMD: Optional[str] = None
     
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
@@ -43,4 +66,4 @@ class Settings(BaseSettings):
         extra = "allow"  # Allow extra fields from .env that aren't defined
 
 
-settings = Settings() # type: ignore
+settings = Settings()  # type: ignore

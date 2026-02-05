@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
     products, 
     payments
 )
+from app.api.v1.endpoints import documents
 
 
 # Import routers (we'll create these files)
@@ -66,6 +67,10 @@ app.include_router(customers.router, prefix=settings.API_V1_PREFIX)
 app.include_router(invoices.router, prefix=settings.API_V1_PREFIX)
 app.include_router(products.router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments.router, prefix=settings.API_V1_PREFIX)
+
+
+# Add with other router registrations:
+app.include_router(documents.router, prefix=settings.API_V1_PREFIX)
 # ============================================================================
 # Include Routers (Add these as you create the endpoint files)
 # ============================================================================
