@@ -2,7 +2,7 @@
 WEEK 4 COMPREHENSIVE TEST SCRIPT
 Tests AI-powered document processing with Groq
 
-Usage: python test_week4.py
+Usage: python week4.py
 """
 import requests
 import time
@@ -161,6 +161,16 @@ print("="*80)
 print("  EXTRACTION RESULTS")
 print("="*80 + "\n")
 
+# Helper function to safely get numeric values
+def safe_float(value, default=0.0):
+    """Safely convert value to float, return default if None or invalid"""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
 # Display results
 print(f"📄 Document Information:")
 print(f"   Type: {document['document_type']}")
@@ -169,82 +179,115 @@ print(f"   Status: {document['status']}")
 print(f"   File Size: {document['file_size']:,} bytes\n")
 
 print(f"🏪 Vendor Information:")
-print(f"   Name: {document.get('vendor_name', 'Not extracted')}")
-print(f"   TIN: {document.get('vendor_tin', 'Not extracted')}")
-print(f"   Address: {document.get('vendor_address', 'Not extracted')}")
-print(f"   Phone: {document.get('vendor_phone', 'Not extracted')}\n")
+print(f"   Name: {document.get('vendor_name') or 'Not extracted'}")
+print(f"   TIN: {document.get('vendor_tin') or 'Not extracted'}")
+print(f"   Address: {document.get('vendor_address') or 'Not extracted'}")
+print(f"   Phone: {document.get('vendor_phone') or 'Not extracted'}\n")
 
 print(f"💰 Financial Information:")
-print(f"   Subtotal: ₦{float(document['subtotal']):,.2f}")
-print(f"   VAT ({document['vat_rate']}%): ₦{float(document['vat_amount']):,.2f}")
-print(f"   Total: ₦{float(document['total_amount']):,.2f}\n")
+print(f"   Subtotal: ₦{safe_float(document.get('subtotal')):,.2f}")
+print(f"   VAT ({safe_float(document.get('vat_rate'), 7.5):.1f}%): ₦{safe_float(document.get('vat_amount')):,.2f}")
+print(f"   Total: ₦{safe_float(document.get('total_amount')):,.2f}\n")
 
 if document.get('line_items'):
     print(f"📋 Line Items:")
     for i, item in enumerate(document['line_items'], 1):
         print(f"   {i}. {item.get('description', 'Unknown')}")
-        print(f"      Qty: {item.get('quantity', 0)} × ₦{float(item.get('unit_price', 0)):,.2f} = ₦{float(item.get('amount', 0)):,.2f}")
+        print(f"      Qty: {safe_float(item.get('quantity'), 0)} × ₦{safe_float(item.get('unit_price')):,.2f} = ₦{safe_float(item.get('amount')):,.2f}")
     print()
+else:
+    print(f"📋 Line Items: None extracted\n")
 
 print(f"🏷️  Categorization:")
-print(f"   Category: {document.get('category', 'Not categorized')}")
-print(f"   Payment Method: {document.get('payment_method', 'Not specified')}\n")
+print(f"   Category: {document.get('category') or 'Not categorized'}")
+print(f"   Payment Method: {document.get('payment_method') or 'Not specified'}\n")
 
 print(f"🤖 AI Processing:")
-print(f"   Model: {document.get('ai_model_used', 'Unknown')}")
-print(f"   Confidence: {float(document.get('confidence_score', 0)):.1%}")
-print(f"   OCR Confidence: {float(document.get('ocr_confidence', 0)):.1%}")
-print(f"   Processing Time: {float(document.get('processing_duration_seconds', 0)):.2f}s")
+print(f"   Model: {document.get('ai_model_used') or 'Unknown'}")
+print(f"   Confidence: {safe_float(document.get('confidence_score'), 0):.1%}")
+print(f"   OCR Confidence: {safe_float(document.get('ocr_confidence'), 0):.1%}")
+print(f"   Processing Time: {safe_float(document.get('processing_duration_seconds'), 0):.2f}s")
 print(f"   Requires Review: {'Yes' if document.get('requires_review') else 'No'}\n")
 
-# Step 6: Get statistics
-print("6️⃣  Retrieving statistics...")
-response = requests.get(
-    f"{BASE_URL}/documents/stats/overview",
-    headers=headers
-)
+# Check if processing actually completed
+if document['status'] == 'PENDING':
+    print("⚠️  WARNING: Document is still in PENDING status!")
+    print("   This means the Celery worker may not be processing tasks.\n")
+    print("   Debugging steps:")
+    print("   1. Check if Celery worker is running")
+    print("   2. Check Celery worker logs for errors")
+    print("   3. Verify Redis is running and accessible")
+    print("   4. Check if Tesseract OCR is installed\n")
+elif document['status'] == 'FAILED':
+    print("❌ Processing FAILED!")
+    print(f"   Error: {document.get('processing_error', 'Unknown error')}\n")
+elif document['status'] == 'COMPLETED':
+    print("✅ Processing COMPLETED successfully!\n")
 
-if response.status_code == 200:
-    stats = response.json()
-    print("✅ Statistics retrieved!\n")
-    print("="*80)
-    print("  DOCUMENT STATISTICS")
+# Step 6: Get statistics (only if processing completed)
+if document['status'] == 'COMPLETED':
+    print("6️⃣  Retrieving statistics...")
+    response = requests.get(
+        f"{BASE_URL}/documents/stats/overview",
+        headers=headers
+    )
+
+    if response.status_code == 200:
+        stats = response.json()
+        print("✅ Statistics retrieved!\n")
+        print("="*80)
+        print("  DOCUMENT STATISTICS")
+        print("="*80 + "\n")
+        
+        print(f"📊 Overview:")
+        print(f"   Total Documents: {stats['total_documents']}")
+        print(f"   Completed: {stats['completed']}")
+        print(f"   Pending: {stats['pending_processing']}")
+        print(f"   Failed: {stats['failed']}")
+        print(f"   Requires Review: {stats['requires_review']}")
+        print(f"   Total Amount Processed: ₦{safe_float(stats['total_amount_processed']):,.2f}\n")
+
+    # Step 7: List documents
+    print("7️⃣  Listing all documents...")
+    response = requests.get(
+        f"{BASE_URL}/documents?page=1&page_size=10",
+        headers=headers
+    )
+
+    if response.status_code == 200:
+        data = response.json()
+        print(f"✅ Found {data['total']} document(s)\n")
+        
+        for doc in data['documents'][:3]:
+            print(f"   • {doc['original_filename']}")
+            print(f"     Status: {doc['status']}, Total: ₦{safe_float(doc['total_amount']):,.2f}")
+
+    print("\n" + "="*80)
+    print("  TEST COMPLETED SUCCESSFULLY! 🎉")
     print("="*80 + "\n")
-    
-    print(f"📊 Overview:")
-    print(f"   Total Documents: {stats['total_documents']}")
-    print(f"   Completed: {stats['completed']}")
-    print(f"   Pending: {stats['pending_processing']}")
-    print(f"   Failed: {stats['failed']}")
-    print(f"   Requires Review: {stats['requires_review']}")
-    print(f"   Total Amount Processed: ₦{float(stats['total_amount_processed']):,.2f}\n")
 
-# Step 7: List documents
-print("7️⃣  Listing all documents...")
-response = requests.get(
-    f"{BASE_URL}/documents?page=1&page_size=10",
-    headers=headers
-)
-
-if response.status_code == 200:
-    data = response.json()
-    print(f"✅ Found {data['total']} document(s)\n")
-    
-    for doc in data['documents'][:3]:
-        print(f"   • {doc['original_filename']}")
-        print(f"     Status: {doc['status']}, Total: ₦{float(doc['total_amount']):,.2f}")
-
-print("\n" + "="*80)
-print("  TEST COMPLETED SUCCESSFULLY! 🎉")
-print("="*80 + "\n")
-
-print("✅ Week 4 AI Document Processing is WORKING!")
-print("\nNext steps:")
-print("1. Try uploading real receipt images")
-print("2. Test with different document types")
-print("3. Review low-confidence extractions")
-print("4. Build frontend interface")
-print("\nGreat job! Ready for Week 5! 🚀\n")
+    print("✅ Week 4 AI Document Processing is WORKING!")
+    print("\nNext steps:")
+    print("1. Try uploading real receipt images")
+    print("2. Test with different document types")
+    print("3. Review low-confidence extractions")
+    print("4. Build frontend interface")
+    print("\nGreat job! Ready for Week 5! 🚀\n")
+else:
+    print("\n" + "="*80)
+    print("  TEST INCOMPLETE - CELERY WORKER ISSUE")
+    print("="*80 + "\n")
+    print("The document was uploaded but Celery didn't process it.")
+    print("\nTroubleshooting checklist:")
+    print("☐ Is Redis running? (redis-server)")
+    print("☐ Is Celery worker running? (celery -A app.celery_app worker)")
+    print("☐ Is Tesseract installed? (tesseract --version)")
+    print("☐ Check Celery worker logs for errors")
+    print("☐ Check .env file has GROQ_API_KEY set")
+    print("\nRun these commands:")
+    print("1. redis-cli ping  # Should return PONG")
+    print("2. tesseract --version  # Should show version")
+    print("3. Check Celery worker terminal for task processing\n")
 
 # Cleanup
 test_receipt_path.unlink()

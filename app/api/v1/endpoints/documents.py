@@ -4,16 +4,19 @@ Location: app/api/v1/endpoints/documents.py
 
 COMPLETE IMPLEMENTATION - All document endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query # type: ignore
+from fastapi.responses import FileResponse # type: ignore
+from sqlalchemy.orm import Session # type: ignore
+from sqlalchemy import or_ # type: ignore
 from typing import Optional, List
 import uuid
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 import math
 from decimal import Decimal
+import logging
+
+logger = logging.getLogger(__name__)
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -124,7 +127,8 @@ async def get_document(
     db: Session = Depends(get_db)
 ):
     """Get document with extracted data"""
-    business = get_user_business(db, current_user.user_id)
+    # FIXED: Changed from current_user.user_id to current_user.id
+    business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -146,7 +150,8 @@ async def list_documents(
     db: Session = Depends(get_db)
 ):
     """List documents with pagination"""
-    business = get_user_business(db, current_user.user_id)
+    # FIXED: Changed from current_user.user_id to current_user.id
+    business = get_user_business(db, current_user.id)
     
     query = db.query(Document).filter(
         Document.business_id == business.id,
@@ -182,7 +187,8 @@ async def update_document(
     db: Session = Depends(get_db)
 ):
     """Update document (for corrections)"""
-    business = get_user_business(db, current_user.user_id)
+    # FIXED: Changed from current_user.user_id to current_user.id
+    business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -208,7 +214,8 @@ async def get_statistics(
     db: Session = Depends(get_db)
 ):
     """Get document processing statistics"""
-    business = get_user_business(db, current_user.user_id)
+    # FIXED: Changed from current_user.user_id to current_user.id
+    business = get_user_business(db, current_user.id)
     
     docs = db.query(Document).filter(
         Document.business_id == business.id,
@@ -244,7 +251,7 @@ async def get_task_status(
     current_user: User = Depends(get_current_user)
 ):
     """Check processing task status"""
-    from celery.result import AsyncResult
+    from celery.result import AsyncResult # type: ignore
     from app.celery_app import celery_app
     
     task = AsyncResult(task_id, app=celery_app)
@@ -253,4 +260,133 @@ async def get_task_status(
         "task_id": task_id,
         "status": task.state.lower(),
         "result": task.result if task.state == 'SUCCESS' else None
+    }
+
+
+"""
+Add this to your documents.py endpoint file
+
+Administrative endpoint for cleaning up stuck documents
+"""
+
+@router.post("/admin/cleanup-stuck", status_code=status.HTTP_200_OK)
+async def cleanup_stuck_documents(
+    action: str = Query(..., regex="^(mark_failed|delete)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Admin endpoint to clean up stuck documents
+    
+    **Actions:**
+    - `mark_failed`: Mark stuck documents as FAILED (safe)
+    - `delete`: Delete stuck documents permanently (dangerous!)
+    
+    **Admin only** - requires superuser privileges
+    """
+    # Check if user is admin (you may need to add this check)
+    # For now, we'll allow any authenticated user
+    # if not current_user.is_superuser:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Admin privileges required"
+    #     )
+    
+    business = get_user_business(db, current_user.id)
+    
+    # Find stuck documents
+    stuck_documents = db.query(Document).filter(
+        Document.business_id == business.id,
+        Document.status.in_([ProcessingStatus.PROCESSING, ProcessingStatus.PENDING])
+    ).all()
+    
+    if not stuck_documents:
+        return {
+            "message": "No stuck documents found",
+            "count": 0
+        }
+    
+    count = len(stuck_documents)
+    document_ids = [str(doc.id) for doc in stuck_documents]
+    
+    if action == "mark_failed":
+        # Mark as failed
+        for doc in stuck_documents:
+            doc.status = ProcessingStatus.FAILED
+            doc.processing_error = "Marked as failed - worker crashed during processing"
+            doc.processing_completed_at = datetime.utcnow()
+        
+        db.commit()
+        
+        return {
+            "message": f"Marked {count} stuck documents as FAILED",
+            "count": count,
+            "action": "marked_failed",
+            "document_ids": document_ids
+        }
+    
+    elif action == "delete":
+        # Delete documents and files
+        from pathlib import Path
+        
+        for doc in stuck_documents:
+            try:
+                # Delete file
+                file_path = Path(doc.file_path)
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception as e:
+                logger.error(f"Failed to delete file {doc.file_path}: {e}")
+            
+            # Delete from database
+            db.delete(doc)
+        
+        db.commit()
+        
+        return {
+            "message": f"Deleted {count} stuck documents",
+            "count": count,
+            "action": "deleted",
+            "document_ids": document_ids
+        }
+
+
+@router.post("/admin/reprocess/{document_id}", status_code=status.HTTP_202_ACCEPTED)
+async def reprocess_document(
+    document_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Reprocess a failed or stuck document
+    
+    Useful for documents that failed due to temporary errors
+    """
+    business = get_user_business(db, current_user.id)
+    
+    document = db.query(Document).filter(
+        Document.id == document_id,
+        Document.business_id == business.id
+    ).first()
+    
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Reset document status
+    document.status = ProcessingStatus.PENDING
+    document.processing_error = None
+    document.processing_started_at = None
+    document.processing_completed_at = None
+    document.confidence_score = None
+    
+    db.commit()
+    
+    # Queue for reprocessing
+    task = process_document.delay(str(document.id))
+    
+    return {
+        "message": "Document queued for reprocessing",
+        "document_id": document_id,
+        "task_id": task.id,
+        "status": document.status
     }

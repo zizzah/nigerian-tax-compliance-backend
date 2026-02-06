@@ -4,7 +4,7 @@ Location: app/tasks/document_processing.py
 
 Powered by Groq AI for fast, efficient processing
 """
-from celery import Task
+from celery import Task # type: ignore
 from app.celery_app import celery_app # type: ignore
 from app.core.database import SessionLocal
 from app.models.document import Document, ProcessingStatus
@@ -131,7 +131,9 @@ def process_document(self, document_id: str):
         document.document_number = extracted_data.get('document_number') # type: ignore
         document.document_date = extracted_data.get('document_date') # type: ignore
         
-        document.line_items = extracted_data.get('line_items', [])
+        # Convert line_items Decimals to floats before saving to JSONB
+        line_items_raw = extracted_data.get('line_items', [])
+        document.line_items = convert_decimals(line_items_raw)
         
         document.subtotal = extracted_data.get('subtotal', 0)
         document.vat_amount = extracted_data.get('vat_amount', 0)
@@ -145,7 +147,7 @@ def process_document(self, document_id: str):
         if not extracted_data.get('category') and document.vendor_name: # type: ignore
             try:
                 line_items = document.line_items or []
-                description = line_items[0].get('description', '') if line_items else ''
+                description = line_items[0].get('description', '') if line_items else '' # type: ignore
                 category = groq.categorize_expense(description, document.vendor_name) # type: ignore
                 document.category = category # type: ignore
             except Exception as e:
