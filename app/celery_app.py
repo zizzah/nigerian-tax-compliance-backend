@@ -9,7 +9,8 @@ from app.core.config import settings
 celery_app = Celery(
     'nigerian_tax_compliance',
     broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL
+    backend=settings.REDIS_URL,
+    include=['app.tasks.document_processing']  # ← ADDED THIS LINE
 )
 
 # Configure Celery
@@ -26,11 +27,9 @@ celery_app.conf.update(
     result_expires=3600,  # Results expire after 1 hour
     task_acks_late=True,
     worker_log_format='[%(asctime)s: %(levelname)s/%(processName)s] %(message)s',
-    worker_task_log_format='[%(asctime)s: %(levelname)s/%(processName)s][%(task_name)s(%(task_id)s)] %(message)s'
+    worker_task_log_format='[%(asctime)s: %(levelname)s/%(processName)s][%(task_name)s(%(task_id)s)] %(message)s',
+    imports=['app.tasks.document_processing']  # ← ADDED THIS LINE TOO
 )
-
-# Auto-discover tasks
-celery_app.autodiscover_tasks(['app.tasks'])
 
 @celery_app.task(bind=True)
 def debug_task(self):

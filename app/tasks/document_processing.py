@@ -5,13 +5,15 @@ Location: app/tasks/document_processing.py
 Powered by Groq AI for fast, efficient processing
 """
 from celery import Task
-from app.celery_app import celery_app
+from app.celery_app import celery_app # type: ignore
 from app.core.database import SessionLocal
 from app.models.document import Document, ProcessingStatus
 from app.services.ocr.preprocessor import ImagePreprocessor
 from app.services.ocr.extractor import OCRExtractor
 from app.services.ai.groq_extractor import GroqReceiptExtractor
 from datetime import datetime
+from decimal import Decimal
+import json
 import logging
 import uuid
 import time
@@ -46,6 +48,17 @@ class DocumentProcessingTask(Task):
             logger.error(f"Failed to update document status: {e}")
         finally:
             db.close()
+
+
+def convert_decimals(obj):
+    """Recursively convert Decimal objects to float for JSON serialization"""
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimals(item) for item in obj]
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
 
 @celery_app.task(base=DocumentProcessingTask, bind=True, max_retries=3)
@@ -145,8 +158,8 @@ def process_document(self, document_id: str):
         document.confidence_score = extracted_data.get('confidence_score') # type: ignore
         document.requires_review = extracted_data.get('requires_review', False)
         
-        # Save full AI response for debugging
-        document.ai_extracted_data = extracted_data # type: ignore
+        # Save full AI response for debugging (convert Decimals first)
+        document.ai_extracted_data = convert_decimals(extracted_data)
         document.ai_model_used = "llama-3.3-70b-versatile" # type: ignore
         
         # Mark as completed

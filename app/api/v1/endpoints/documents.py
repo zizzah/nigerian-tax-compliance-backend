@@ -57,7 +57,7 @@ async def upload_document(
     **File types:** PNG, JPG, PDF (max 10MB)
     **Processing:** ~10-15 seconds with Groq AI
     """
-    business = get_user_business(db, current_user.user_id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     # Validate file
     allowed_types = ["image/png", "image/jpeg", "image/jpg", "application/pdf"]
