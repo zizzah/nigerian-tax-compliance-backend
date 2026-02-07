@@ -33,7 +33,7 @@ from pathlib import Path
 from datetime import date, timedelta, datetime
 from typing import Dict, List, Optional, Tuple
 import random
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw # type: ignore
 
 # ============================================================================
 # CONFIGURATION
@@ -282,7 +282,7 @@ def test_authentication():
     
     if assert_response(response, 200, "Login successful"):
         try:
-            result = response.json()
+            result = response.json() # type: ignore
             data.token = result["access_token"]
             data.headers = {"Authorization": f"Bearer {data.token}"}
             print_info(f"Token obtained: {data.token[:30]}...")
@@ -340,7 +340,7 @@ def test_business_management():
     response = make_request('GET', '/businesses/me', headers=data.headers)
     
     if assert_response(response, 200, "Get business profile"):
-        data.business = response.json()
+        data.business = response.json() # type: ignore
         print_info(f"Business: {data.business.get('business_name', 'Unknown')}")
         print_info(f"Subscription: {data.business.get('subscription_tier', 'Unknown')}")
     else:
@@ -360,7 +360,7 @@ def test_business_management():
         }
         response = make_request('POST', '/businesses', json=business_data, headers=data.headers)
         if assert_response(response, 201, "Create business"):
-            data.business = response.json()
+            data.business = response.json() # type: ignore
     
     # Test 2.2: Update business
     print_test("2.2", "Update Business Profile")
@@ -380,7 +380,7 @@ def test_business_management():
     print_test("2.4", "Get Next Invoice Number")
     response = make_request('GET', '/businesses/me/next-invoice-number', headers=data.headers)
     if assert_response(response, 200, "Get next invoice number"):
-        result = response.json()
+        result = response.json() # type: ignore
         print_info(f"Next invoice: {result.get('next_invoice_number', 'Unknown')}")
 
 
@@ -426,13 +426,13 @@ def test_customer_management():
     for customer_data in customers_to_create:
         response = make_request('POST', '/customers', json=customer_data, headers=data.headers)
         if assert_response(response, 201, f"Create customer: {customer_data['name']}"):
-            data.customers.append(response.json())
+            data.customers.append(response.json()) # type: ignore
     
     # Test 3.2: List customers
     print_test("3.2", "List Customers (Paginated)")
     response = make_request('GET', '/customers?page=1&page_size=10', headers=data.headers)
     if assert_response(response, 200, "List customers"):
-        result = response.json()
+        result = response.json() # type: ignore
         print_info(f"Total customers: {result.get('total', 0)}")
     
     # Test 3.3: Search customers
@@ -519,7 +519,7 @@ def test_product_management():
             product_data.pop('sku', None)
             response = make_request('POST', '/products', json=product_data, headers=data.headers)
             if assert_response(response, 201, f"Create product: {product_data['name']}"):
-                data.products.append(response.json())
+                data.products.append(response.json()) # type: ignore
         else:
             print_error(f"Failed to create: {product_data['name']}")
             stats.record_fail()
@@ -595,7 +595,7 @@ def test_invoice_management():
     
     response = make_request('POST', '/invoices', json=invoice_data, headers=data.headers)
     if assert_response(response, 201, "Create simple invoice"):
-        invoice = response.json()
+        invoice = response.json() # type: ignore
         data.invoices.append(invoice)
         print_info(f"Invoice: {invoice['invoice_number']}")
         print_info(f"Total: {format_currency(invoice['total_amount'])}")
@@ -629,7 +629,7 @@ def test_invoice_management():
     
     response = make_request('POST', '/invoices', json=invoice_data, headers=data.headers)
     if assert_response(response, 201, "Create multi-item invoice"):
-        invoice = response.json()
+        invoice = response.json() # type: ignore
         data.invoices.append(invoice)
         print_info(f"Subtotal: {format_currency(invoice['subtotal'])}")
         print_info(f"Tax: {format_currency(invoice['tax_amount'])}")
@@ -681,7 +681,7 @@ def test_invoice_management():
         invoice_id = data.invoices[0]['id']
         response = make_request('GET', f'/invoices/{invoice_id}/pdf', headers=data.headers)
         if assert_response(response, 200, "Download PDF"):
-            print_info(f"PDF size: {len(response.content):,} bytes")
+            print_info(f"PDF size: {len(response.content):,} bytes") # type: ignore
 
 
 # ============================================================================
@@ -711,7 +711,7 @@ def test_payment_management():
     
     response = make_request('POST', '/payments', json=payment_data, headers=data.headers)
     if assert_response(response, 201, "Record full payment"):
-        payment = response.json()
+        payment = response.json() # type: ignore
         data.payments.append(payment)
         print_info(f"Amount: {format_currency(payment['amount'])}")
         print_info(f"Receipt: {payment.get('receipt_number', 'N/A')}")
@@ -731,7 +731,7 @@ def test_payment_management():
         
         response = make_request('POST', '/payments', json=payment_data, headers=data.headers)
         if assert_response(response, 201, "Record partial payment"):
-            data.payments.append(response.json())
+            data.payments.append(response.json()) # type: ignore
     
     # Test 6.3: List payments
     print_test("6.3", "List Payments")
@@ -888,7 +888,7 @@ def test_document_processing():
             
             response = make_request('GET', f'/documents/{document_id}', headers=data.headers)
             if assert_response(response, 200, "Get processed document"):
-                document = response.json()
+                document = response.json() # type: ignore
                 data.documents.append(document)
                 
                 print_info(f"Status: {document['status']}")

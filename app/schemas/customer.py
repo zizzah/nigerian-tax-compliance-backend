@@ -2,7 +2,7 @@
 Customer Pydantic Schemas
 Location: app/schemas/customer.py
 """
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, EmailStr, Field, validator # type: ignore
 from typing import Optional
 from decimal import Decimal
 from datetime import datetime, date

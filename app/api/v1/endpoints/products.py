@@ -8,10 +8,10 @@ IMPROVEMENTS:
 3. Clearer validation errors
 4. Better handling of edge cases
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from sqlalchemy.exc import IntegrityError
+from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
+from sqlalchemy.orm import Session # type: ignore
+from sqlalchemy import or_ # type: ignore
+from sqlalchemy.exc import IntegrityError # type: ignore
 from typing import Optional
 import uuid
 import math

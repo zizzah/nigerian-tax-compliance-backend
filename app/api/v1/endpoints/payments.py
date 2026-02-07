@@ -2,8 +2,8 @@
 Payment API Endpoints
 Location: app/api/v1/endpoints/payments.py
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
+from sqlalchemy.orm import Session # type: ignore
 from typing import Optional
 import uuid
 import math

@@ -34,7 +34,7 @@ print("✅ Logged in successfully\n")
 
 # Step 2: Create a test receipt image
 print("2️⃣  Creating test receipt...")
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont # type: ignore
 
 # Create a simple receipt image
 img = Image.new('RGB', (600, 800), color='white')
@@ -291,3 +291,10 @@ else:
 
 # Cleanup
 test_receipt_path.unlink()
+
+
+
+
+
+# Replace the current @app.get("/") and @app.get("/health") with code from:
+# fix_01_health_endpoints.py

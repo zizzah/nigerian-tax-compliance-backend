@@ -2,7 +2,7 @@
 Payment Pydantic Schemas
 Location: app/schemas/payment.py
 """
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator # type: ignore
 from typing import Optional
 from decimal import Decimal
 from datetime import datetime, date

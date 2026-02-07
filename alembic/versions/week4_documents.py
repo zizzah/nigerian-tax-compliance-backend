@@ -6,10 +6,10 @@ Create Date: 2026-02-05 09:00:00
 
 """
 from typing import Sequence, Union
-from alembic import op
-import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
-from sqlalchemy import text
+from alembic import op # type: ignore
+import sqlalchemy as sa # type: ignore
+from sqlalchemy.dialects import postgresql # type: ignore
+from sqlalchemy import text # type: ignore
 
 # revision identifiers, used by Alembic.
 revision: str = 'week4_documents'

@@ -2,8 +2,8 @@
 User Management Endpoints
 Location: app/api/v1/endpoints/users.py
 """
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, status # type: ignore
+from sqlalchemy.orm import Session # type: ignore
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, get_current_verified_user # type: ignore

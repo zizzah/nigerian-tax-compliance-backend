@@ -7,7 +7,7 @@ Groq provides FAST and COST-EFFECTIVE AI inference
 - 90% cheaper than Claude
 - Perfect for document processing
 """
-from groq import Groq
+from groq import Groq # type: ignore
 from typing import Dict, Any, Optional, List
 import json
 import logging
