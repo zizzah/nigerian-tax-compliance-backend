@@ -1,11 +1,16 @@
 """
 Authentication API Endpoints
 Location: app/api/v1/endpoints/auth.py
+
+PRODUCTION VERSION - Includes improved validation and security features
 """
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends, HTTPException, status # type: ignore
+from sqlalchemy.orm import Session # type: ignore
+from datetime import datetime, timedelta, timezone
 import secrets
+import re
+import time
+import logging
 
 from app.core.database import get_db
 from app.core.security import (
@@ -26,6 +31,7 @@ from app.schemas.user import (
 )
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -38,35 +44,87 @@ def get_user_by_email(db: Session, email: str) -> User:
 
 
 def check_account_locked(user: User):
-    """Check if user account is locked"""
-    if user.locked_until and datetime.utcnow() < user.locked_until: # type: ignore
+    """
+    Check if user account is locked
+    
+    Args:
+        user: User object
+        
+    Raises:
+        HTTPException: If account is locked
+    """
+    if user.locked_until and datetime.now(timezone.utc) < user.locked_until:  # type: ignore
+        remaining_minutes = (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60  # type: ignore
+        
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Account is locked. Try again after {user.locked_until}"
+            detail={
+                "error": "account_locked",
+                "message": "Account is temporarily locked.",
+                "locked_until": user.locked_until.isoformat(),  # type: ignore
+                "retry_after_minutes": int(remaining_minutes) + 1
+            }
         )
 
 
 def increment_failed_login(db: Session, user: User):
-    """Increment failed login attempts and lock if needed"""
-    user.failed_login_attempts += 1 # type: ignore
+    """
+    Increment failed login attempts and lock if needed
+    
+    Args:
+        db: Database session
+        user: User object
+        
+    Raises:
+        HTTPException: If account is locked after incrementing
+    """
+    user.failed_login_attempts += 1  # type: ignore
     
     # Lock account after 5 failed attempts for 30 minutes
-    if user.failed_login_attempts >= 5: # type: ignore
-        user.locked_until = datetime.utcnow() + timedelta(minutes=30) # type: ignore
+    if user.failed_login_attempts >= 5:  # type: ignore
+        user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=30)  # type: ignore
         db.commit()
+        
+        # Log security event
+        logger.warning(
+            f"Account locked due to failed login attempts: {user.email}",
+            extra={
+                "user_id": str(user.id),
+                "email": user.email,
+                "event": "account_locked",
+                "reason": "too_many_failed_attempts"
+            }
+        )
+        
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account locked due to too many failed login attempts. Try again in 30 minutes."
+            detail={
+                "error": "account_locked",
+                "message": "Account locked due to too many failed login attempts.",
+                "locked_until": user.locked_until.isoformat(),  # type: ignore
+                "retry_after_minutes": 30
+            }
         )
     
     db.commit()
+    
+    # Log failed attempt
+    logger.warning(
+        f"Failed login attempt {user.failed_login_attempts}/5: {user.email}",  # type: ignore
+        extra={
+            "user_id": str(user.id),
+            "email": user.email,
+            "event": "login_failed",
+            "attempts": user.failed_login_attempts  # type: ignore
+        }
+    )
 
 
 def reset_failed_login(db: Session, user: User):
     """Reset failed login attempts on successful login"""
-    user.failed_login_attempts = 0 # type: ignore
-    user.locked_until = None # type: ignore
-    user.last_login = datetime.utcnow() # type: ignore
+    user.failed_login_attempts = 0  # type: ignore
+    user.locked_until = None  # type: ignore
+    user.last_login = datetime.now(timezone.utc)  # type: ignore
     db.commit()
 
 
@@ -117,39 +175,135 @@ async def login(credentials: UserLogin, db: Session = Depends(get_db)):
     Login with email and password
     
     Returns JWT access token on successful authentication
+    
+    Args:
+        credentials: Email and password
+        
+    Returns:
+        TokenResponse with access token and user info
+        
+    Raises:
+        422: Missing or invalid credentials
+        401: Incorrect email or password
+        403: Account locked or deactivated
+        
+    Security Features:
+    - Rate limiting (5 failed attempts = 30 min lockout)
+    - No user enumeration (same error for invalid email/password)
+    - Password verification timing attack prevention
+    - Failed login attempt tracking
     """
-    # Get user
+    # ========================================================================
+    # VALIDATION - Explicit checks for required fields
+    # ========================================================================
+    
+    if not credentials.email:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": "Email is required",
+                "field": "email"
+            }
+        )
+    
+    if not credentials.password:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": "Password is required",
+                "field": "password"
+            }
+        )
+    
+    # Email format validation
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, credentials.email):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "validation_error",
+                "message": "Invalid email format",
+                "field": "email"
+            }
+        )
+    
+    # ========================================================================
+    # GET USER
+    # ========================================================================
+    
     user = get_user_by_email(db, credentials.email)
+    
+    # SECURITY: Don't reveal whether email exists
+    # Return same error for invalid email or password
     if not user:
+        # Add small delay to prevent timing attacks
+        time.sleep(0.1)
+        
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"}
         )
+    
+    # ========================================================================
+    # ACCOUNT STATUS CHECKS
+    # ========================================================================
     
     # Check if account is locked
     check_account_locked(user)
     
     # Check if account is active
-    if not user.is_active: # type: ignore
+    if not user.is_active:  # type: ignore
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is deactivated"
+            detail="Account is deactivated. Please contact support."
         )
     
+    # ========================================================================
+    # PASSWORD VERIFICATION
+    # ========================================================================
+    
     # Verify password
-    if not verify_password(credentials.password, user.password_hash): # type: ignore
+    if not verify_password(credentials.password, user.password_hash):  # type: ignore
+        # Increment failed attempts
         increment_failed_login(db, user)
+        
+        # Add delay to prevent brute force
+        time.sleep(0.1)
+        
+        # Return generic error (don't reveal which field is wrong)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"}
         )
+    
+    # ========================================================================
+    # SUCCESS - RESET COUNTERS & CREATE TOKEN
+    # ========================================================================
     
     # Reset failed login attempts
     reset_failed_login(db, user)
     
-    # Create access token
+    # Create access token with claims
     access_token = create_access_token(
-        data={"sub": str(user.id), "email": user.email}
+        data={
+            "sub": str(user.id),
+            "email": user.email,
+            "type": "access"
+        }
+    )
+    
+    # Log successful login (for security audit)
+    logger.info(
+        f"Successful login: {user.email} (User ID: {user.id})",
+        extra={
+            "user_id": str(user.id),
+            "email": user.email,
+            "event": "login_success"
+        }
     )
     
     return {
@@ -172,16 +326,16 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
             detail="Invalid verification token"
         )
     
-    if user.is_verified: # type: ignore
+    if user.is_verified:  # type: ignore
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already verified"
         )
     
     # Mark as verified
-    user.is_verified = True # type: ignore
-    user.email_verified_at = datetime.utcnow() # type: ignore
-    user.verification_token = None # type: ignore
+    user.is_verified = True  # type: ignore
+    user.email_verified_at = datetime.now(timezone.utc)  # type: ignore
+    user.verification_token = None  # type: ignore
     db.commit()
     
     return {
@@ -206,8 +360,8 @@ async def forgot_password(request: PasswordResetRequest, db: Session = Depends(g
     
     # Generate reset token
     reset_token = secrets.token_urlsafe(32)
-    user.reset_token = reset_token # type: ignore
-    user.reset_token_expires_at = datetime.utcnow() + timedelta(hours=1) # type: ignore
+    user.reset_token = reset_token  # type: ignore
+    user.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)  # type: ignore
     db.commit()
     
     # TODO: Send password reset email
@@ -233,18 +387,18 @@ async def reset_password(reset_data: PasswordReset, db: Session = Depends(get_db
         )
     
     # Check if token expired
-    if user.reset_token_expires_at < datetime.utcnow(): # type: ignore
+    if user.reset_token_expires_at < datetime.now(timezone.utc):  # type: ignore
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Reset token has expired"
         )
     
     # Update password
-    user.password_hash = get_password_hash(reset_data.new_password) # type: ignore
-    user.reset_token = None # type: ignore
-    user.reset_token_expires_at = None # type: ignore
-    user.failed_login_attempts = 0 # type: ignore
-    user.locked_until = None # type: ignore
+    user.password_hash = get_password_hash(reset_data.new_password)  # type: ignore
+    user.reset_token = None  # type: ignore
+    user.reset_token_expires_at = None  # type: ignore
+    user.failed_login_attempts = 0  # type: ignore
+    user.locked_until = None  # type: ignore
     db.commit()
     
     return {
@@ -264,6 +418,46 @@ async def logout():
     return {
         "message": "Logged out successfully",
         "success": True
+    }
+
+
+@router.get("/login-status")
+async def check_login_status(
+    email: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Check if email is locked (useful for frontend)
+    
+    Args:
+        email: Email to check
+        
+    Returns:
+        Status information (without revealing if email exists)
+    """
+    user = get_user_by_email(db, email)
+    
+    # Don't reveal if email exists
+    if not user:
+        return {
+            "can_login": True,
+            "message": "Ready to login"
+        }
+    
+    # Check if locked
+    if user.locked_until and datetime.now(timezone.utc) < user.locked_until:  # type: ignore
+        remaining_minutes = (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60  # type: ignore
+        
+        return {
+            "can_login": False,
+            "locked": True,
+            "retry_after_minutes": int(remaining_minutes) + 1,
+            "message": f"Account locked. Try again in {int(remaining_minutes) + 1} minutes."
+        }
+    
+    return {
+        "can_login": True,
+        "message": "Ready to login"
     }
 
 

@@ -11,7 +11,7 @@ from app.models.document import Document, ProcessingStatus
 from app.services.ocr.preprocessor import ImagePreprocessor
 from app.services.ocr.extractor import OCRExtractor
 from app.services.ai.groq_extractor import GroqReceiptExtractor
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import json
 import logging
@@ -34,11 +34,11 @@ class DocumentProcessingTask(Task):
             if document:
                 document.status = ProcessingStatus.FAILED # type: ignore
                 document.processing_error = str(exc)[:500]  # type: ignore # Limit error length
-                document.processing_completed_at = datetime.utcnow() # type: ignore
+                document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
                 
                 # Calculate processing duration
                 if document.processing_started_at: # type: ignore
-                    duration = (datetime.utcnow() - document.processing_started_at).total_seconds()
+                    duration = (datetime.now(timezone.utc) - document.processing_started_at).total_seconds()
                     document.processing_duration_seconds = duration
                 
                 db.commit()
@@ -92,7 +92,7 @@ def process_document(self, document_id: str):
         
         # Update status
         document.status = ProcessingStatus.PROCESSING # type: ignore
-        document.processing_started_at = datetime.utcnow() # type: ignore
+        document.processing_started_at = datetime.now(timezone.utc) # type: ignore
         db.commit()
         
         start_time = time.time()
@@ -166,7 +166,7 @@ def process_document(self, document_id: str):
         
         # Mark as completed
         document.status = ProcessingStatus.COMPLETED # type: ignore
-        document.processing_completed_at = datetime.utcnow() # type: ignore
+        document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
         
         # Calculate processing duration
         processing_duration = time.time() - start_time
@@ -196,10 +196,10 @@ def process_document(self, document_id: str):
         if document:
             document.status = ProcessingStatus.FAILED # type: ignore
             document.processing_error = str(e)[:500] # type: ignore
-            document.processing_completed_at = datetime.utcnow() # type: ignore
+            document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
             
             if document.processing_started_at: # type: ignore
-                duration = (datetime.utcnow() - document.processing_started_at).total_seconds()
+                duration = (datetime.now(timezone.utc) - document.processing_started_at).total_seconds()
                 document.processing_duration_seconds = duration
             
             db.commit()
@@ -255,7 +255,7 @@ def cleanup_old_documents(days: int = 90):
     db = SessionLocal()
     
     try:
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
         
         # Find old archived documents
         old_docs = db.query(Document).filter(
