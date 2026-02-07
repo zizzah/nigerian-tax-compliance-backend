@@ -2,15 +2,23 @@
 FastAPI Main Application with Authentication
 Location: app/main.py
 """
-from fastapi import FastAPI # type: ignore
+from fastapi import FastAPI, Depends # type: ignore
+from fastapi.responses import JSONResponse # type: ignore
+from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from starlette.middleware.base import BaseHTTPMiddleware # type: ignore
+from starlette.requests import Request # type: ignore
+from starlette.exceptions import HTTPException as StarletteHTTPException # type: ignore
+from fastapi.exceptions import RequestValidationError # type: ignore
 
 from datetime import datetime, timezone
-from fastapi.responses import JSONResponse # type: ignore
 from sqlalchemy import text # type: ignore
-from app.core.database import get_db
 from sqlalchemy.orm import Session # type: ignore
-from fastapi import Depends # type: ignore
-from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from sqlalchemy.exc import DBAPIError # type: ignore
+
+import asyncio
+import logging
+
+from app.core.database import get_db
 from app.core.config import settings
 from app.api.v1.endpoints import (
     auth, 
@@ -19,9 +27,9 @@ from app.api.v1.endpoints import (
     customers, 
     invoices, 
     products, 
-    payments
+    payments,
+    documents
 )
-from app.api.v1.endpoints import documents
 from app.core.exceptions import (
     http_exception_handler,
     validation_exception_handler,
@@ -30,16 +38,66 @@ from app.core.exceptions import (
     database_exception_handler,
     BaseAPIException
 )
-from starlette.exceptions import HTTPException as StarletteHTTPException # type: ignore
-from fastapi.exceptions import RequestValidationError # type: ignore
-from sqlalchemy.exc import DBAPIError # type: ignore
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+
+logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Timeout Middleware - Prevents Hanging Requests
+# ============================================================================
+
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    """
+    Prevent requests from hanging forever
+    
+    Times out requests after 30 seconds (configurable)
+    """
+    
+    def __init__(self, app, timeout: int = 30):
+        super().__init__(app)
+        self.timeout = timeout
+    
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await asyncio.wait_for(
+                call_next(request),
+                timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Request timeout: {request.url.path}")
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": {
+                        "type": "timeout_error",
+                        "code": 504,
+                        "message": f"Request timed out after {self.timeout}s",
+                        "path": str(request.url.path),
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                }
+            )
 
 
-# Import routers (we'll create these files)
-# Note: You'll need to create these files in app/api/v1/endpoints/
-# from app.api.v1.endpoints import auth, users
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def check_redis():
+    """Helper function for Redis check with timeout"""
+    import redis # type: ignore
+    client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
+    client.ping()
+    client.close()
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -67,7 +125,11 @@ app = FastAPI(
     """
 )
 
-# Configure CORS
+# ============================================================================
+# Middleware Configuration
+# ============================================================================
+
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.BACKEND_CORS_ORIGINS,
@@ -76,22 +138,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Timeout Middleware - Must be added AFTER CORS
+app.add_middleware(TimeoutMiddleware, timeout=30)
+
+# ============================================================================
+# Router Registration
+# ============================================================================
+
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(users.router, prefix=settings.API_V1_PREFIX)
-
-
-# Add to routers
 app.include_router(businesses.router, prefix=settings.API_V1_PREFIX)
 app.include_router(customers.router, prefix=settings.API_V1_PREFIX)
-
 app.include_router(invoices.router, prefix=settings.API_V1_PREFIX)
 app.include_router(products.router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments.router, prefix=settings.API_V1_PREFIX)
-
-
-# Add with other router registrations:
 app.include_router(documents.router, prefix=settings.API_V1_PREFIX)
 
+# ============================================================================
+# Exception Handlers
+# ============================================================================
 
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
@@ -100,245 +165,165 @@ app.add_exception_handler(DBAPIError, database_exception_handler)
 app.add_exception_handler(Exception, general_exception_handler)
 
 # ============================================================================
-# Include Routers (Add these as you create the endpoint files)
+# Health Check Endpoints - PRODUCTION READY
 # ============================================================================
 
-# Example of how to include routers:
-# app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
-# app.include_router(users.router, prefix=settings.API_V1_PREFIX)
-
-# TODO: Uncomment above lines after creating the endpoint files
-
-
-# ============================================================================
-# Root Endpoints
-# ============================================================================
-
-
-@app.get("/", tags=["System"], response_model=dict)
+@app.get("/", tags=["System"])
 async def root():
     """
-    Root endpoint - API information and service discovery
+    Ultra-fast root endpoint - no dependency checks
     
-    Provides:
-    - API metadata
-    - Environment information
-    - Available endpoints
-    - Documentation links
-    
-    Used for API discovery and basic connectivity testing.
+    Provides API metadata and service discovery.
+    Used for basic connectivity testing.
     """
     return {
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "status": "operational",
-        "environment": settings.ENVIRONMENT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "documentation": {
-            "swagger_ui": "/docs",
-            "redoc": "/redoc",
-            "openapi_json": "/openapi.json"
-        },
+        "documentation": "/docs",
         "endpoints": {
             "health": "/health",
-            "api_base": settings.API_V1_PREFIX,
-            "authentication": f"{settings.API_V1_PREFIX}/auth",
-            "businesses": f"{settings.API_V1_PREFIX}/businesses",
-            "customers": f"{settings.API_V1_PREFIX}/customers",
-            "products": f"{settings.API_V1_PREFIX}/products",
-            "invoices": f"{settings.API_V1_PREFIX}/invoices",
-            "payments": f"{settings.API_V1_PREFIX}/payments",
-            "documents": f"{settings.API_V1_PREFIX}/documents"
-        },
-        "support": {
-            "email": "support@yourdomain.com",
-            "documentation": "https://docs.yourdomain.com"
+            "alive": "/alive",
+            "ready": "/ready",
+            "api_base": settings.API_V1_PREFIX
         }
+    }
+
+
+@app.get("/alive", tags=["System"])
+async def alive():
+    """
+    Kubernetes liveness probe - no dependency checks
+    
+    Simple check that the application process is running.
+    Does not check database, Redis, or other dependencies.
+    
+    Use this for:
+    - Kubernetes liveness probes
+    - Container health checks
+    - Uptime monitoring
+    """
+    return {
+        "alive": True,
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
 @app.get("/health", tags=["System"])
 async def health_check(db: Session = Depends(get_db)):
     """
-    Comprehensive health check endpoint
+    Fast health check with 5-second total timeout
     
     Checks:
-    - API responsiveness ✓
-    - Database connectivity ✓
-    - Redis connectivity (Celery broker) ✓
-    - Celery workers status ✓
+    - Database connectivity (3s timeout)
+    - Redis connectivity (2s timeout)
     
     Returns:
-    - 200: Healthy (all systems operational)
-    - 200: Degraded (some non-critical systems down)
-    - 503: Unhealthy (critical systems down)
+    - 200: Healthy (all critical systems operational)
+    - 200: Degraded (Redis down, API still functional)
+    - 503: Unhealthy (database down, API cannot function)
     
-    This endpoint is used by:
-    - Load balancers for health checks
-    - Kubernetes liveness/readiness probes
-    - Monitoring systems (Datadog, New Relic)
-    - Uptime monitors (UptimeRobot, Pingdom)
+    Use this for:
+    - Load balancer health checks
+    - Monitoring systems
+    - General health monitoring
     """
     health_status = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": settings.APP_VERSION,
-        "environment": settings.ENVIRONMENT,
         "checks": {}
     }
     
-    # 1. Database check (CRITICAL)
+    # Database check (3-second timeout) - CRITICAL
     try:
-        result = db.execute(text("SELECT 1"))
-        db.commit()
-        health_status["checks"]["database"] = {
-            "status": "healthy",
-            "type": "postgresql",
-            "message": "Database connection successful"
-        }
-    except Exception as e:
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: db.execute(text("SELECT 1"))),
+            timeout=3.0
+        )
+        health_status["checks"]["database"] = {"status": "healthy"}
+    except asyncio.TimeoutError:
+        logger.error("Database health check timeout")
         health_status["status"] = "unhealthy"
         health_status["checks"]["database"] = {
             "status": "unhealthy",
-            "type": "postgresql",
-            "message": f"Database connection failed: {str(e)[:100]}"
-        }
-    
-    # 2. Redis check (NON-CRITICAL - for Celery)
-    try:
-        import redis # type: ignore
-        redis_client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
-        redis_client.ping()
-        redis_client.close()
-        health_status["checks"]["redis"] = {
-            "status": "healthy",
-            "message": "Redis connection successful"
+            "message": "Database timeout"
         }
     except Exception as e:
-        # Redis is not critical - API can function without Celery
+        logger.error(f"Database health check failed: {e}")
+        health_status["status"] = "unhealthy"
+        health_status["checks"]["database"] = {
+            "status": "unhealthy",
+            "message": str(e)[:100]
+        }
+    
+    # Redis check (2-second timeout) - NON-CRITICAL
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: check_redis()),
+            timeout=2.0
+        )
+        health_status["checks"]["redis"] = {"status": "healthy"}
+    except asyncio.TimeoutError:
+        logger.warning("Redis health check timeout")
         if health_status["status"] == "healthy":
             health_status["status"] = "degraded"
         health_status["checks"]["redis"] = {
             "status": "degraded",
-            "message": f"Redis unavailable: {str(e)[:100]}"
+            "message": "Redis timeout"
         }
-    
-    # 3. Celery workers check (NON-CRITICAL)
-    try:
-        from app.celery_app import celery_app
-        inspect = celery_app.control.inspect(timeout=2)
-        workers = inspect.active()
-        
-        if workers and len(workers) > 0:
-            health_status["checks"]["celery"] = {
-                "status": "healthy",
-                "workers_count": len(workers),
-                "message": f"{len(workers)} Celery worker(s) active"
-            }
-        else:
-            if health_status["status"] == "healthy":
-                health_status["status"] = "degraded"
-            health_status["checks"]["celery"] = {
-                "status": "degraded",
-                "workers_count": 0,
-                "message": "No active Celery workers detected"
-            }
     except Exception as e:
+        logger.warning(f"Redis health check failed: {e}")
         if health_status["status"] == "healthy":
             health_status["status"] = "degraded"
-        health_status["checks"]["celery"] = {
+        health_status["checks"]["redis"] = {
             "status": "degraded",
-            "message": f"Celery check failed: {str(e)[:100]}"
+            "message": "Redis unavailable"
         }
     
-    # 4. Disk space check (NON-CRITICAL)
-    try:
-        import shutil
-        disk_usage = shutil.disk_usage("/")
-        free_gb = disk_usage.free / (1024 ** 3)
-        total_gb = disk_usage.total / (1024 ** 3)
-        percent_free = (disk_usage.free / disk_usage.total) * 100
-        
-        if percent_free < 10:
-            if health_status["status"] == "healthy":
-                health_status["status"] = "degraded"
-            disk_status = "warning"
-        else:
-            disk_status = "healthy"
-        
-        health_status["checks"]["disk_space"] = {
-            "status": disk_status,
-            "free_gb": round(free_gb, 2),
-            "total_gb": round(total_gb, 2),
-            "percent_free": round(percent_free, 1),
-            "message": f"{round(free_gb, 1)}GB free of {round(total_gb, 1)}GB"
-        }
-    except Exception as e:
-        health_status["checks"]["disk_space"] = {
-            "status": "unknown",
-            "message": f"Could not check disk space: {str(e)[:100]}"
-        }
-    
-    # 5. Memory check (INFORMATIONAL)
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        health_status["checks"]["memory"] = {
-            "status": "healthy",
-            "percent_used": memory.percent,
-            "available_gb": round(memory.available / (1024 ** 3), 2),
-            "total_gb": round(memory.total / (1024 ** 3), 2)
-        }
-    except ImportError:
-        # psutil not installed - skip
-        pass
-    except Exception as e:
-        health_status["checks"]["memory"] = {
-            "status": "unknown",
-            "message": f"Could not check memory: {str(e)[:100]}"
-        }
-    
-    # Determine HTTP status code
+    # Return appropriate status code
     if health_status["status"] == "unhealthy":
-        return JSONResponse(
-            status_code=503,
-            content=health_status
-        )
-    elif health_status["status"] == "degraded":
-        # Return 200 but with degraded status
-        # This allows load balancers to keep the instance alive
-        # while alerting that something is wrong
-        return JSONResponse(
-            status_code=200,
-            content=health_status
-        )
+        return JSONResponse(status_code=503, content=health_status)
     
     return health_status
 
 
-# Additional utility endpoint for readiness check
 @app.get("/ready", tags=["System"])
 async def readiness_check(db: Session = Depends(get_db)):
     """
     Kubernetes readiness probe endpoint
     
-    Returns 200 only if critical services are available.
-    Unlike /health, this returns 503 if anything is wrong.
+    Returns 200 only if critical services (database) are available.
+    Unlike /health, this returns 503 immediately if database is down.
     
     Use this for:
     - Kubernetes readiness probes
     - Load balancer backend pool checks
+    - Determining if instance can receive traffic
     """
     try:
-        # Check database
-        db.execute(text("SELECT 1"))
-        db.commit()
+        # Quick database check with timeout
+        await asyncio.wait_for(
+            asyncio.to_thread(lambda: db.execute(text("SELECT 1"))),
+            timeout=3.0
+        )
         
         return {
             "ready": True,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+    except asyncio.TimeoutError:
+        logger.error("Readiness check: database timeout")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ready": False,
+                "error": "Database timeout",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        )
     except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
         return JSONResponse(
             status_code=503,
             content={
@@ -349,21 +334,54 @@ async def readiness_check(db: Session = Depends(get_db)):
         )
 
 
-# Additional utility endpoint for liveness check
-@app.get("/alive", tags=["System"])
-async def liveness_check():
-    """
-    Kubernetes liveness probe endpoint
-    
-    Simple check that the application is running.
-    Does not check dependencies.
-    
-    Use this for:
-    - Kubernetes liveness probes
-    - Simple uptime monitoring
-    """
-    return {
-        "alive": True,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": settings.APP_VERSION
-    }
+# ============================================================================
+# Prometheus Metrics (Optional - uncomment if using Prometheus)
+# ============================================================================
+
+# from prometheus_client import Counter, Histogram, generate_latest
+# from prometheus_fastapi_instrumentator import Instrumentator
+
+# # Request metrics
+# request_count = Counter(
+#     'http_requests_total', 
+#     'Total HTTP requests', 
+#     ['method', 'endpoint', 'status']
+# )
+# request_duration = Histogram(
+#     'http_request_duration_seconds', 
+#     'HTTP request duration'
+# )
+
+# # Document processing metrics
+# doc_processed = Counter(
+#     'documents_processed_total', 
+#     'Total documents processed', 
+#     ['status']
+# )
+# doc_processing_time = Histogram(
+#     'document_processing_seconds', 
+#     'Document processing time'
+# )
+
+# # Initialize instrumentator
+# Instrumentator().instrument(app).expose(app)
+
+
+# ============================================================================
+# Sentry Error Tracking (Optional - uncomment if using Sentry)
+# ============================================================================
+
+# import sentry_sdk
+# from sentry_sdk.integrations.fastapi import FastApiIntegration
+# from sentry_sdk.integrations.celery import CeleryIntegration
+
+# if hasattr(settings, 'SENTRY_DSN') and settings.SENTRY_DSN:
+#     sentry_sdk.init(
+#         dsn=settings.SENTRY_DSN,
+#         integrations=[
+#             FastApiIntegration(),
+#             CeleryIntegration()
+#         ],
+#         traces_sample_rate=0.1,  # 10% of transactions
+#         environment=settings.ENVIRONMENT
+#     )
