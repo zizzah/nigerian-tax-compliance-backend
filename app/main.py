@@ -1,6 +1,8 @@
 """
 FastAPI Main Application with Authentication
 Location: app/main.py
+
+FIXED VERSION - Removed async from health endpoints to prevent timeouts
 """
 from fastapi import FastAPI, Depends # type: ignore
 from fastapi.responses import JSONResponse # type: ignore
@@ -84,18 +86,6 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 
 # ============================================================================
-# Helper Functions
-# ============================================================================
-
-def check_redis():
-    """Helper function for Redis check with timeout"""
-    import redis # type: ignore
-    client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
-    client.ping()
-    client.close()
-
-
-# ============================================================================
 # FastAPI Application
 # ============================================================================
 
@@ -165,16 +155,18 @@ app.add_exception_handler(DBAPIError, database_exception_handler)
 app.add_exception_handler(Exception, general_exception_handler)
 
 # ============================================================================
-# Health Check Endpoints - PRODUCTION READY
+# Health Check Endpoints - FIXED VERSION (NO ASYNC)
 # ============================================================================
 
 @app.get("/", tags=["System"])
-async def root():
+def root():
     """
     Ultra-fast root endpoint - no dependency checks
     
     Provides API metadata and service discovery.
     Used for basic connectivity testing.
+    
+    FIXED: Removed async to prevent timeout issues
     """
     return {
         "name": settings.APP_NAME,
@@ -192,7 +184,7 @@ async def root():
 
 
 @app.get("/alive", tags=["System"])
-async def alive():
+def alive():
     """
     Kubernetes liveness probe - no dependency checks
     
@@ -203,6 +195,8 @@ async def alive():
     - Kubernetes liveness probes
     - Container health checks
     - Uptime monitoring
+    
+    FIXED: Removed async to prevent timeout issues
     """
     return {
         "alive": True,
@@ -211,13 +205,13 @@ async def alive():
 
 
 @app.get("/health", tags=["System"])
-async def health_check(db: Session = Depends(get_db)):
+def health_check(db: Session = Depends(get_db)):
     """
-    Fast health check with 5-second total timeout
+    Fast health check - simplified without asyncio
     
     Checks:
-    - Database connectivity (3s timeout)
-    - Redis connectivity (2s timeout)
+    - Database connectivity (synchronous)
+    - Redis connectivity (synchronous)
     
     Returns:
     - 200: Healthy (all critical systems operational)
@@ -228,6 +222,8 @@ async def health_check(db: Session = Depends(get_db)):
     - Load balancer health checks
     - Monitoring systems
     - General health monitoring
+    
+    FIXED: Removed async/await and asyncio.to_thread to prevent timeouts
     """
     health_status = {
         "status": "healthy",
@@ -235,20 +231,11 @@ async def health_check(db: Session = Depends(get_db)):
         "checks": {}
     }
     
-    # Database check (3-second timeout) - CRITICAL
+    # Database check (CRITICAL) - SYNCHRONOUS
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(lambda: db.execute(text("SELECT 1"))),
-            timeout=3.0
-        )
+        # Direct synchronous call - no async wrapper needed
+        db.execute(text("SELECT 1"))
         health_status["checks"]["database"] = {"status": "healthy"}
-    except asyncio.TimeoutError:
-        logger.error("Database health check timeout")
-        health_status["status"] = "unhealthy"
-        health_status["checks"]["database"] = {
-            "status": "unhealthy",
-            "message": "Database timeout"
-        }
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
         health_status["status"] = "unhealthy"
@@ -256,22 +243,16 @@ async def health_check(db: Session = Depends(get_db)):
             "status": "unhealthy",
             "message": str(e)[:100]
         }
+        # Return 503 if database is down
+        return JSONResponse(status_code=503, content=health_status)
     
-    # Redis check (2-second timeout) - NON-CRITICAL
+    # Redis check (NON-CRITICAL) - SYNCHRONOUS
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(lambda: check_redis()),
-            timeout=2.0
-        )
+        import redis # type: ignore
+        client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+        client.ping()
+        client.close()
         health_status["checks"]["redis"] = {"status": "healthy"}
-    except asyncio.TimeoutError:
-        logger.warning("Redis health check timeout")
-        if health_status["status"] == "healthy":
-            health_status["status"] = "degraded"
-        health_status["checks"]["redis"] = {
-            "status": "degraded",
-            "message": "Redis timeout"
-        }
     except Exception as e:
         logger.warning(f"Redis health check failed: {e}")
         if health_status["status"] == "healthy":
@@ -281,15 +262,11 @@ async def health_check(db: Session = Depends(get_db)):
             "message": "Redis unavailable"
         }
     
-    # Return appropriate status code
-    if health_status["status"] == "unhealthy":
-        return JSONResponse(status_code=503, content=health_status)
-    
     return health_status
 
 
 @app.get("/ready", tags=["System"])
-async def readiness_check(db: Session = Depends(get_db)):
+def readiness_check(db: Session = Depends(get_db)):
     """
     Kubernetes readiness probe endpoint
     
@@ -300,28 +277,17 @@ async def readiness_check(db: Session = Depends(get_db)):
     - Kubernetes readiness probes
     - Load balancer backend pool checks
     - Determining if instance can receive traffic
+    
+    FIXED: Removed async/await to prevent timeouts
     """
     try:
-        # Quick database check with timeout
-        await asyncio.wait_for(
-            asyncio.to_thread(lambda: db.execute(text("SELECT 1"))),
-            timeout=3.0
-        )
+        # Quick database check - synchronous
+        db.execute(text("SELECT 1"))
         
         return {
             "ready": True,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-    except asyncio.TimeoutError:
-        logger.error("Readiness check: database timeout")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "ready": False,
-                "error": "Database timeout",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        )
     except Exception as e:
         logger.error(f"Readiness check failed: {e}")
         return JSONResponse(
