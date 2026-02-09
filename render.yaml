@@ -1,17 +1,8 @@
 services:
   - type: web
-    name: nigerian-tax-backend
+    name: nigerian-tax-compliance-backend
     env: python
-    region: oregon
     plan: free
-    buildCommand: pip install --upgrade pip && pip install --prefer-binary -r requirements.txt
+    runtime: python-3.11.8
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: PIP_PREFER_BINARY
-        value: 1
-      - key: DATABASE_URL
-        fromDatabase:
-          name: tax-db
-          property: connectionString
