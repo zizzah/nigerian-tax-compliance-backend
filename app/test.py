@@ -1,7 +1,7 @@
 # test_dependencies.py
-import pytesseract
-from PIL import Image
-import spacy
+import pytesseract # type: ignore
+from PIL import Image # type: ignore
+import spacy # type: ignore
 
 print("Testing installed dependencies...\n")
 

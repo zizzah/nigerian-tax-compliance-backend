@@ -14,13 +14,14 @@
 ║  ✅ Better timeout handling                                                  ║
 ║  ✅ Improved error messages                                                  ║
 ║  ✅ Graceful degradation for optional features                              ║
+║  ✅ FIXED: Health check endpoint paths (not under /api/v1)                  ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Usage: python scripts/test_all_features.py
 
 Author: AI Tax Platform Team
-Version: 2.0.0 (Production Ready)
+Version: 2.0.1 (Health Check Fix Applied)
 Python: 3.11+
 """
 
@@ -211,22 +212,34 @@ data = TestData()
 
 
 # ============================================================================
-# TEST SUITE 0: HEALTH CHECKS
+# TEST SUITE 0: HEALTH CHECKS - FIXED VERSION
 # ============================================================================
 
 def test_health_checks():
-    """Test API health and connectivity"""
+    """Test API health and connectivity - FIXED VERSION"""
     print_header("TEST SUITE 0: HEALTH CHECKS")
+    
+    # ========================================================================
+    # CRITICAL FIX: Remove /api/v1 from BASE_URL for health checks
+    # Health endpoints are at ROOT level, NOT under /api/v1
+    # ========================================================================
+    base_server_url = BASE_URL.replace('/api/v1', '')
     
     # Test 0.1: Root endpoint
     print_test("0.1", "Root Endpoint")
     try:
-        response = make_request('GET', '/')
-        if response:
-            assert_response(response, 200, "Root endpoint accessible")
+        print(f"   → GET {base_server_url}/")
+        response = requests.get(f"{base_server_url}/", timeout=REQUEST_TIMEOUT)
+        if response and response.status_code == 200:
+            print_success("Root endpoint accessible: PASSED (200)")
+            stats.record_pass()
         else:
-            print_warning("Root endpoint not responding - may need server restart")
+            print_warning(f"Root endpoint: {response.status_code if response else 'No response'}")
             stats.record_fail()
+    except requests.exceptions.ConnectionError:
+        print_error("Cannot connect to server - is it running?")
+        print_info("Start server with: uvicorn app.main:app --reload")
+        stats.record_fail()
     except Exception as e:
         print_error(f"Root endpoint test failed: {e}")
         stats.record_fail()
@@ -234,32 +247,74 @@ def test_health_checks():
     # Test 0.2: Health endpoint
     print_test("0.2", "Health Check Endpoint")
     try:
-        response = make_request('GET', '/health')
+        print(f"   → GET {base_server_url}/health")
+        response = requests.get(f"{base_server_url}/health", timeout=REQUEST_TIMEOUT)
         if response:
-            # Accept both 200 (healthy) and 503 (degraded but responding)
+            # Accept 200 (healthy) or 503 (degraded)
             if response.status_code in [200, 503]:
-                print_success(f"Health check responding: {response.status_code}")
+                health_data = response.json()
+                status = health_data.get('status', 'unknown')
+                print_success(f"Health check: PASSED ({response.status_code} - {status})")
+                
+                # Show component status
+                checks = health_data.get('checks', {})
+                if checks:
+                    db_status = checks.get('database', {}).get('status', 'unknown')
+                    redis_status = checks.get('redis', {}).get('status', 'unknown')
+                    print_info(f"Database: {db_status}, Redis: {redis_status}")
+                
                 stats.record_pass()
             else:
-                assert_response(response, 200, "Health check passed")
-        else:
-            print_warning("Health check not responding - checking alternate endpoint")
-            # Try /alive endpoint instead
-            alive_response = make_request('GET', '/alive')
-            if alive_response:
-                assert_response(alive_response, 200, "Alive check passed")
-            else:
-                print_error("Neither /health nor /alive responding")
+                print_error(f"Health check unexpected status: {response.status_code}")
                 stats.record_fail()
+        else:
+            print_error("Health check not responding")
+            stats.record_fail()
     except Exception as e:
-        print_error(f"Health check test failed: {e}")
+        print_error(f"Health check failed: {e}")
         stats.record_fail()
     
-    # Test 0.3: API docs
-    print_test("0.3", "API Documentation")
+    # Test 0.3: Alive endpoint
+    print_test("0.3", "Alive Check Endpoint")
     try:
-        response = requests.get(f"{BASE_URL.replace('/api/v1', '')}/docs", timeout=REQUEST_TIMEOUT)
-        assert_response(response, 200, "Swagger UI accessible")
+        print(f"   → GET {base_server_url}/alive")
+        response = requests.get(f"{base_server_url}/alive", timeout=REQUEST_TIMEOUT)
+        if response and response.status_code == 200:
+            print_success("Alive check: PASSED (200)")
+            stats.record_pass()
+        else:
+            print_error(f"Alive check failed: {response.status_code if response else 'No response'}")
+            stats.record_fail()
+    except Exception as e:
+        print_error(f"Alive check failed: {e}")
+        stats.record_fail()
+    
+    # Test 0.4: Ready endpoint
+    print_test("0.4", "Ready Check Endpoint")
+    try:
+        print(f"   → GET {base_server_url}/ready")
+        response = requests.get(f"{base_server_url}/ready", timeout=REQUEST_TIMEOUT)
+        if response and response.status_code == 200:
+            print_success("Ready check: PASSED (200)")
+            stats.record_pass()
+        else:
+            print_warning(f"Ready check: {response.status_code if response else 'No response'}")
+            stats.record_fail()
+    except Exception as e:
+        print_error(f"Ready check failed: {e}")
+        stats.record_fail()
+    
+    # Test 0.5: API documentation
+    print_test("0.5", "API Documentation")
+    try:
+        print(f"   → GET {base_server_url}/docs")
+        response = requests.get(f"{base_server_url}/docs", timeout=REQUEST_TIMEOUT)
+        if response and response.status_code == 200:
+            print_success("Swagger UI accessible: PASSED (200)")
+            stats.record_pass()
+        else:
+            print_error("API docs not accessible")
+            stats.record_fail()
     except Exception as e:
         print_error(f"API docs test failed: {e}")
         stats.record_fail()
