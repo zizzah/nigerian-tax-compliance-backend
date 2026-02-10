@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy all requirements files
-COPY requirements-main_.txt requirements-additional.txt requirements-dev.txt ./
+COPY requirements-main.txt requirements-additional.txt requirements-dev.txt ./
 
 # Upgrade pip
 RUN pip install --upgrade pip
