@@ -1,6 +1,7 @@
 services:
   - type: web
-    name: your-service-name
-    env: python
-    runtime: python-3.12.8
-    # ... rest of your config
+    name: nigerian-tax-compliance-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    plan: free
