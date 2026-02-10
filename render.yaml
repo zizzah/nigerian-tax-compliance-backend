@@ -5,3 +5,13 @@ services:
     dockerfilePath: ./Dockerfile
     region: oregon
     plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: false
