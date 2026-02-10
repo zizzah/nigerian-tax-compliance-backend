@@ -18,7 +18,7 @@ COPY requirements-main.txt requirements-additional.txt requirements-dev.txt ./
 RUN pip install --upgrade pip
 
 # Install Python dependencies in order
-RUN pip install --no-cache-dir -r requirements-main_.txt
+RUN pip install --no-cache-dir -r requirements-main.txt
 RUN pip install --no-cache-dir -r requirements-additional.txt
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
