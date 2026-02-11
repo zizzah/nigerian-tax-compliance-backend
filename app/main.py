@@ -249,7 +249,7 @@ def health_check(db: Session = Depends(get_db)):
     # Redis check (NON-CRITICAL) - SYNCHRONOUS
     try:
         import redis # type: ignore
-        client = redis.from_url(settings.REDIS_URL, socket_connect_timeout=2)
+        client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2, ssl=True, ssl_cert_reqs='none')
         client.ping()
         client.close()
         health_status["checks"]["redis"] = {"status": "healthy"}
@@ -298,6 +298,9 @@ def readiness_check(db: Session = Depends(get_db)):
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         )
+    
+
+
 
 
 # ============================================================================

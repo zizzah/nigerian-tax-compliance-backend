@@ -1,17 +1,34 @@
 services:
   - type: web
-    name: nigerian-tax-compliance-backend
-    env: docker
-    dockerfilePath: ./Dockerfile
-    region: oregon
-    plan: free
-    healthCheckPath: /health
+    name: nigerian-tax-compliance-api
+    env: python
+    buildCommand: "pip install -r requirements.txt --break-system-packages && apt-get update && apt-get install -y tesseract-ocr"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: nigerian-tax-db
+          property: connectionString
       - key: SECRET_KEY
         generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: QSTASH_TOKEN
+        sync: false
+      - key: QSTASH_CURRENT_SIGNING_KEY
+        sync: false
+      - key: QSTASH_NEXT_SIGNING_KEY
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        value: https://your-app-name.onrender.com
+      - key: PYTHON_VERSION
+        value: 3.11.0
       - key: ENVIRONMENT
         value: production
       - key: DEBUG
         value: false
+
+databases:
+  - name: nigerian-tax-db
+    databaseName: nigerian_tax_compliance
+    user: admin

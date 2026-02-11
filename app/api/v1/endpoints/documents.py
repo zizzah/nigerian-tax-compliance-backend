@@ -1,25 +1,23 @@
 """
-Document Processing API Endpoints
+Document Processing API Endpoints - QStash Version
 Location: app/api/v1/endpoints/documents.py
 
-PRODUCTION VERSION - Fixed cross-platform file paths per deployment guide
+UPDATED: Uses QStash instead of Celery for background processing
 """
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query # type: ignore
 from fastapi.responses import FileResponse # type: ignore
 from sqlalchemy.orm import Session # type: ignore
-from sqlalchemy import or_ # type: ignore
 from typing import Optional, List
 import uuid
 from pathlib import Path
-from datetime import date, datetime, timezone
-import math
-from decimal import Decimal
+from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger(__name__)
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.core.config import settings
 from app.models.user import User
 from app.models.business import Business
 from app.models.document import Document, DocumentType, ProcessingStatus
@@ -30,7 +28,7 @@ from app.schemas.document import (
     DocumentUpdate,
     DocumentStatistics
 )
-from app.tasks.document_processing import process_document
+from app.services.qstash_client import qstash
 
 router = APIRouter(prefix="/documents", tags=["Documents - AI Processing"])
 
@@ -57,17 +55,14 @@ async def upload_document(
     """
     Upload receipt/document for AI processing with Groq
     
+    **UPDATED: Uses QStash for serverless background processing**
+    
     **File types:** PNG, JPG, PDF (max 10MB)
     **Processing:** ~10-15 seconds with Groq AI
-    
-    FIXED: Cross-platform file paths using pathlib.Path
     """
     business = get_user_business(db, current_user.id)
     
-    # ========================================================================
-    # VALIDATE FILE TYPE
-    # ========================================================================
-    
+    # Validate file type
     allowed_types = ["image/png", "image/jpeg", "image/jpg", "application/pdf"]
     if file.content_type not in allowed_types:
         raise HTTPException(
@@ -75,10 +70,7 @@ async def upload_document(
             detail=f"Invalid file type: {file.content_type}. Allowed: PNG, JPG, PDF"
         )
     
-    # ========================================================================
-    # CHECK FILE SIZE (Max 10MB)
-    # ========================================================================
-    
+    # Check file size (Max 10MB)
     file_size = 0
     max_size = 10 * 1024 * 1024  # 10MB in bytes
     
@@ -90,34 +82,23 @@ async def upload_document(
                 detail=f"File too large: {file_size / (1024*1024):.1f}MB (max 10MB)"
             )
     
-    # Reset file pointer to beginning
     file.file.seek(0)
     
-    # ========================================================================
-    # CROSS-PLATFORM FILE PATH HANDLING - CRITICAL FIX
-    # ========================================================================
-    
-    # Use pathlib for cross-platform paths (works on Windows, Linux, macOS)
+    # Create upload directory
     upload_base = Path("uploads") / "documents"
     upload_dir = upload_base / str(business.id)
-    
-    # Create directory (works on Windows and Linux)
     upload_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate unique filename with proper extension
+    # Generate unique filename
     if file.filename:
         file_ext = Path(file.filename).suffix or ".jpg"
     else:
-        # Default to .jpg if no filename provided
         file_ext = ".jpg"
     
     unique_filename = f"{uuid.uuid4()}{file_ext}"
     file_path = upload_dir / unique_filename
     
-    # ========================================================================
-    # SAVE FILE TO DISK
-    # ========================================================================
-    
+    # Save file to disk
     try:
         with open(file_path, "wb") as f:
             content = file.file.read()
@@ -132,16 +113,13 @@ async def upload_document(
             detail=f"Failed to save file: {str(e)}"
         )
     
-    # ========================================================================
-    # CREATE DOCUMENT RECORD
-    # ========================================================================
-    
+    # Create document record
     try:
         document = Document(
             business_id=business.id,
             document_type=DocumentType(document_type),
             original_filename=file.filename or "unknown",
-            file_path=str(file_path),  # Store as string in database
+            file_path=str(file_path),
             file_size=file_size,
             file_type=file.content_type,
             status=ProcessingStatus.PENDING,
@@ -168,17 +146,34 @@ async def upload_document(
             detail="Failed to create document record"
         )
     
-    # ========================================================================
-    # QUEUE FOR AI PROCESSING
-    # ========================================================================
+    # ====================================================================
+    # QUEUE FOR AI PROCESSING WITH QSTASH (REPLACES CELERY)
+    # ====================================================================
     
     try:
-        task = process_document.delay(str(document.id))
-        logger.info(f"Document queued for processing: {document.id}, Task: {task.id}")
+        # Get your Render service URL from environment variable
+        base_url = getattr(settings, 'RENDER_EXTERNAL_URL', "https://your-app.onrender.com")
+        
+        callback_url = f"{base_url}/api/v1/background/process-document"
+        
+        # Publish task to QStash
+        response = qstash.publish(
+            url=callback_url,
+            body={
+                "document_id": str(document.id),
+                "business_id": str(business.id)
+            },
+            delay=0,  # Process immediately (or set delay in seconds)
+            retries=3  # Retry up to 3 times on failure
+        )
+        
+        task_id = response.get("messageId", "unknown")
+        
+        logger.info(f"Document queued for processing: {document.id}, QStash Message: {task_id}")
         
     except Exception as e:
         logger.error(f"Failed to queue document for processing: {e}")
-        # Document is saved, but processing failed to queue
+        
         # Mark as failed so user knows
         document.status = ProcessingStatus.FAILED
         document.processing_error = "Failed to queue for processing"
@@ -191,7 +186,7 @@ async def upload_document(
     
     return {
         "document_id": document.id,
-        "task_id": task.id,
+        "task_id": task_id,
         "status": document.status,
         "message": "Document uploaded. AI processing started.",
         "estimated_completion_seconds": 15
@@ -204,7 +199,7 @@ async def get_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get document with extracted data"""
+    """Get document details by ID"""
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -223,49 +218,43 @@ async def get_document(
 
 @router.get("/", response_model=DocumentListResponse)
 async def list_documents(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=100),
+    document_type: Optional[DocumentType] = None,
     status: Optional[ProcessingStatus] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List documents with pagination"""
+    """List all documents with optional filtering"""
     business = get_user_business(db, current_user.id)
     
-    query = db.query(Document).filter(
-        Document.business_id == business.id,
-        Document.is_archived == False
-    )
+    query = db.query(Document).filter(Document.business_id == business.id)
+    
+    if document_type:
+        query = query.filter(Document.document_type == document_type)
     
     if status:
         query = query.filter(Document.status == status)
     
     total = query.count()
-    total_pages = math.ceil(total / page_size)
-    offset = (page - 1) * page_size
-    
-    documents = query.order_by(Document.created_at.desc())\
-        .offset(offset)\
-        .limit(page_size)\
-        .all()
+    documents = query.order_by(Document.uploaded_at.desc()).offset(skip).limit(limit).all()
     
     return {
         "documents": documents,
         "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages
+        "skip": skip,
+        "limit": limit
     }
 
 
 @router.patch("/{document_id}", response_model=DocumentResponse)
 async def update_document(
     document_id: uuid.UUID,
-    document_data: DocumentUpdate,
+    update_data: DocumentUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update document (for corrections)"""
+    """Update document metadata (notes, type, etc.)"""
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -279,14 +268,13 @@ async def update_document(
             detail="Document not found"
         )
     
-    update_data = document_data.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
+    # Update fields
+    update_dict = update_data.dict(exclude_unset=True)
+    for field, value in update_dict.items():
         setattr(document, field, value)
     
     db.commit()
     db.refresh(document)
-    
-    logger.info(f"Document updated: {document_id}")
     
     return document
 
@@ -297,11 +285,7 @@ async def delete_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Delete document and its file
-    
-    FIXED: Cross-platform file deletion using pathlib
-    """
+    """Delete a document and its file"""
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -315,34 +299,29 @@ async def delete_document(
             detail="Document not found"
         )
     
-    # Delete file using pathlib (cross-platform)
+    # Delete physical file
     try:
         file_path = Path(document.file_path)
         if file_path.exists():
             file_path.unlink()
-            logger.info(f"File deleted: {file_path}")
+            logger.info(f"Deleted file: {file_path}")
     except Exception as e:
         logger.error(f"Failed to delete file {document.file_path}: {e}")
-        # Continue with database deletion even if file deletion fails
     
-    # Delete from database
+    # Delete database record
     db.delete(document)
     db.commit()
     
-    logger.info(f"Document deleted: {document_id}")
+    return None
 
 
-@router.get("/download/{document_id}")
+@router.get("/{document_id}/download")
 async def download_document(
     document_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Download original document file
-    
-    FIXED: Cross-platform file path handling
-    """
+    """Download the original document file"""
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -356,187 +335,61 @@ async def download_document(
             detail="Document not found"
         )
     
-    # Use pathlib to check file existence (cross-platform)
     file_path = Path(document.file_path)
     
     if not file_path.exists():
-        logger.error(f"File not found: {file_path}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found on disk"
+            detail="File not found on server"
         )
     
-    # Return file for download
     return FileResponse(
-        path=str(file_path),  # Convert Path to string for FileResponse
+        path=str(file_path),
         filename=document.original_filename,
         media_type=document.file_type
     )
 
 
-@router.get("/stats/overview", response_model=DocumentStatistics)
-async def get_statistics(
+@router.get("/statistics/summary", response_model=DocumentStatistics)
+async def get_document_statistics(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Get document processing statistics"""
     business = get_user_business(db, current_user.id)
     
-    docs = db.query(Document).filter(
+    total_documents = db.query(Document).filter(Document.business_id == business.id).count()
+    
+    processed = db.query(Document).filter(
         Document.business_id == business.id,
-        Document.is_archived == False
-    ).all()
+        Document.status == ProcessingStatus.COMPLETED
+    ).count()
     
-    total = len(docs)
-    completed = len([d for d in docs if d.status.value == ProcessingStatus.COMPLETED.value])
-    failed = len([d for d in docs if d.status.value == ProcessingStatus.FAILED.value])
-    pending = total - completed - failed
-    requires_review = len([d for d in docs if d.requires_review is True])
+    pending = db.query(Document).filter(
+        Document.business_id == business.id,
+        Document.status == ProcessingStatus.PENDING
+    ).count()
     
-    total_amount = sum(float(d.total_amount or 0) for d in docs)
+    failed = db.query(Document).filter(
+        Document.business_id == business.id,
+        Document.status == ProcessingStatus.FAILED
+    ).count()
     
     return {
-        "total_documents": total,
-        "pending_processing": pending,
-        "completed": completed,
-        "failed": failed,
-        "requires_review": requires_review,
-        "total_amount_processed": total_amount,
-        "average_confidence_score": None,
-        "average_processing_time": None,
-        "by_type": {},
-        "by_category": {},
-        "by_status": {}
+        "total_documents": total_documents,
+        "processed": processed,
+        "pending": pending,
+        "failed": failed
     }
 
 
-@router.get("/tasks/{task_id}")
-async def get_task_status(
-    task_id: str,
-    current_user: User = Depends(get_current_user)
-):
-    """Check processing task status"""
-    from celery.result import AsyncResult # type: ignore
-    from app.celery_app import celery_app
-    
-    task = AsyncResult(task_id, app=celery_app)
-    
-    return {
-        "task_id": task_id,
-        "status": task.state.lower(),
-        "result": task.result if task.state == 'SUCCESS' else None,
-        "error": str(task.info) if task.state == 'FAILURE' else None
-    }
-
-
-# ============================================================================
-# ADMIN ENDPOINTS - Document Recovery and Maintenance
-# ============================================================================
-
-@router.post("/admin/cleanup-stuck", status_code=status.HTTP_200_OK)
-async def cleanup_stuck_documents(
-    action: str = Query(..., pattern="^(mark_failed|delete)$"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Admin endpoint to clean up stuck documents
-    
-    **Actions:**
-    - `mark_failed`: Mark stuck documents as FAILED (safe)
-    - `delete`: Delete stuck documents permanently (dangerous!)
-    
-    **Stuck documents** are those in PROCESSING/PENDING status for >10 minutes
-    
-    **Admin only** - requires superuser privileges
-    """
-    # TODO: Uncomment when is_superuser field is available
-    # if not current_user.is_superuser:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="Admin privileges required"
-    #     )
-    
-    business = get_user_business(db, current_user.id)
-    
-    # Find stuck documents (processing for >10 minutes)
-    from datetime import timedelta
-    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=10)
-    
-    stuck_documents = db.query(Document).filter(
-        Document.business_id == business.id,
-        Document.status.in_([ProcessingStatus.PROCESSING, ProcessingStatus.PENDING]),
-        Document.created_at < cutoff_time
-    ).all()
-    
-    if not stuck_documents:
-        return {
-            "message": "No stuck documents found",
-            "count": 0
-        }
-    
-    count = len(stuck_documents)
-    document_ids = [str(doc.id) for doc in stuck_documents]
-    
-    if action == "mark_failed":
-        # Mark as failed
-        for doc in stuck_documents:
-            doc.status = ProcessingStatus.FAILED
-            doc.processing_error = "Marked as failed - worker crashed during processing"
-            doc.processing_completed_at = datetime.now(timezone.utc)
-        
-        db.commit()
-        
-        logger.warning(f"Marked {count} stuck documents as FAILED")
-        
-        return {
-            "message": f"Marked {count} stuck documents as FAILED",
-            "count": count,
-            "action": "marked_failed",
-            "document_ids": document_ids
-        }
-    
-    elif action == "delete":
-        # Delete documents and files (DANGEROUS!)
-        deleted_files = 0
-        
-        for doc in stuck_documents:
-            try:
-                # Delete file using pathlib (cross-platform)
-                file_path = Path(doc.file_path)
-                if file_path.exists():
-                    file_path.unlink()
-                    deleted_files += 1
-            except Exception as e:
-                logger.error(f"Failed to delete file {doc.file_path}: {e}")
-            
-            # Delete from database
-            db.delete(doc)
-        
-        db.commit()
-        
-        logger.warning(f"Deleted {count} stuck documents ({deleted_files} files)")
-        
-        return {
-            "message": f"Deleted {count} stuck documents",
-            "count": count,
-            "deleted_files": deleted_files,
-            "action": "deleted",
-            "document_ids": document_ids
-        }
-
-
-@router.post("/admin/reprocess/{document_id}", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/{document_id}/reprocess", response_model=DocumentUploadResponse)
 async def reprocess_document(
     document_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Reprocess a failed or stuck document
-    
-    Useful for documents that failed due to temporary errors
-    """
+    """Reprocess a failed or completed document"""
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -550,49 +403,47 @@ async def reprocess_document(
             detail="Document not found"
         )
     
-    # Verify file still exists (cross-platform check)
-    file_path = Path(document.file_path)
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found on disk. Cannot reprocess."
-        )
-    
     # Reset document status
     document.status = ProcessingStatus.PENDING
     document.processing_error = None
-    document.processing_started_at = None
-    document.processing_completed_at = None
-    document.confidence_score = None
-    
+    document.processed_at = None
     db.commit()
     
-    # Queue for reprocessing
-    task = process_document.delay(str(document.id))
-    
-    logger.info(f"Document queued for reprocessing: {document_id}")
+    # Queue for processing with QStash
+    try:
+        base_url = getattr(settings, 'RENDER_EXTERNAL_URL', "https://your-app.onrender.com")
+        callback_url = f"{base_url}/api/v1/background/process-document"
+        
+        response = qstash.publish(
+            url=callback_url,
+            body={
+                "document_id": str(document.id),
+                "business_id": str(business.id)
+            },
+            delay=0,
+            retries=3
+        )
+        
+        task_id = response.get("messageId", "unknown")
+        
+        logger.info(f"Document requeued for processing: {document.id}, QStash Message: {task_id}")
+        
+    except Exception as e:
+        logger.error(f"Failed to requeue document: {e}")
+        
+        document.status = ProcessingStatus.FAILED
+        document.processing_error = "Failed to queue for reprocessing"
+        db.commit()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to queue document for reprocessing"
+        )
     
     return {
-        "message": "Document queued for reprocessing",
-        "document_id": document_id,
-        "task_id": task.id,
-        "status": document.status
-    }
-
-
-# ============================================================================
-# HEALTH CHECK
-# ============================================================================
-
-@router.get("/health")
-async def documents_health():
-    """Health check for documents endpoints"""
-    # Check uploads directory exists
-    upload_dir = Path("uploads") / "documents"
-    
-    return {
-        "status": "healthy",
-        "service": "documents",
-        "upload_dir_exists": upload_dir.exists(),
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "document_id": document.id,
+        "task_id": task_id,
+        "status": document.status,
+        "message": "Document requeued for AI processing.",
+        "estimated_completion_seconds": 15
     }

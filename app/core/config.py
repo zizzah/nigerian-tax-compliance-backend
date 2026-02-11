@@ -1,5 +1,5 @@
 """
-Application Configuration
+Application Configuration - QStash Version
 Location: app/core/config.py
 """
 from pydantic_settings import BaseSettings # type: ignore
@@ -33,27 +33,30 @@ class Settings(BaseSettings):
     REQUIRE_PASSWORD_SPECIAL: bool = False
     
     # ====================================================================
-    # AI API KEYS - Week 4 Addition
+    # AI API KEYS
     # ====================================================================
     GROQ_API_KEY: str
     ANTHROPIC_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
     
     # ====================================================================
-    # REDIS & CELERY - Week 4 Addition
+    # QSTASH (SERVERLESS BACKGROUND TASKS) - REPLACES REDIS/CELERY
     # ====================================================================
-    REDIS_URL: str = "redis://localhost:6379/0"
-    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
-    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+    QSTASH_TOKEN: str
+    QSTASH_CURRENT_SIGNING_KEY: str
+    QSTASH_NEXT_SIGNING_KEY: str
+    
+    # Render deployment URL (set this in Render dashboard)
+    RENDER_EXTERNAL_URL: Optional[str] = None
     
     # ====================================================================
-    # FILE UPLOAD SETTINGS - Week 4 Addition
+    # FILE UPLOAD SETTINGS
     # ====================================================================
     UPLOAD_DIR: str = "./uploads"
     MAX_UPLOAD_SIZE_MB: int = 10
     
     # ====================================================================
-    # OCR SETTINGS - Week 4 Addition
+    # OCR SETTINGS
     # ====================================================================
     TESSERACT_CMD: Optional[str] = None
     
@@ -63,7 +66,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
-        extra = "allow"  # Allow extra fields from .env that aren't defined
+        extra = "allow"
 
 
 settings = Settings()  # type: ignore

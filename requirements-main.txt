@@ -27,10 +27,23 @@ cryptography==42.0.2
 python-dotenv==1.0.1
 
 # ===============================
-# BACKGROUND TASKS
+# BACKGROUND TASKS - QSTASH (REPLACES CELERY)
 # ===============================
-celery==5.3.6
-redis==5.0.1
+upstash-qstash
+
+# ===============================
+# AI & OCR
+# ===============================
+groq
+pytesseract
+Pillow
+opencv-python-headless
+numpy
+
+# ===============================
+# PDF GENERATION
+# ===============================
+reportlab
 
 # ===============================
 # EMAIL
