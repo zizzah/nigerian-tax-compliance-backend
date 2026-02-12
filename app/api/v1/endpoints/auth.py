@@ -3,8 +3,11 @@ Authentication API Endpoints
 Location: app/api/v1/endpoints/auth.py
 
 PRODUCTION VERSION - Fixed validation errors and improved security
+WITH SECURITY FIXES: Rate limiting on authentication endpoints
+
+FIX APPLIED: Corrected decorator order - rate limiter must be BEFORE router decorator
 """
-from fastapi import APIRouter, Depends, HTTPException, status # type: ignore
+from fastapi import APIRouter, Depends, HTTPException, status, Request # type: ignore
 from sqlalchemy.orm import Session # type: ignore
 from datetime import datetime, timedelta, timezone
 import secrets
@@ -12,6 +15,7 @@ import time
 import logging
 
 from app.core.database import get_db
+from app.core.rate_limit import limiter
 from app.core.security import (
     verify_password, 
     get_password_hash, 
@@ -131,8 +135,15 @@ def reset_failed_login(db: Session, user: User):
 # Authentication Endpoints
 # ============================================================================
 
+# SECURITY FIX: Rate limiter decorator must come BEFORE @router decorator
+# This ensures rate limiting is applied before route handling
+@limiter.limit("3/hour")  # SECURITY: 3 registrations per hour per IP
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserRegister, db: Session = Depends(get_db)):
+async def register(
+    request: Request,  # SECURITY: Required for rate limiting
+    user_data: UserRegister, 
+    db: Session = Depends(get_db)
+):
     """
     Register a new user
     
@@ -170,8 +181,13 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
     return new_user
 
 
+@limiter.limit("5/minute")  # SECURITY: 5 login attempts per minute per IP
 @router.post("/login", response_model=TokenResponse)
-async def login(credentials: UserLogin, db: Session = Depends(get_db)):
+async def login(
+    request: Request,  # SECURITY: Required for rate limiting
+    credentials: UserLogin, 
+    db: Session = Depends(get_db)
+):
     """
     Login with email and password - PRODUCTION VERSION
     
@@ -336,14 +352,19 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
     }
 
 
+@limiter.limit("3/hour")  # SECURITY: Prevent password reset spam
 @router.post("/forgot-password", response_model=MessageResponse)
-async def forgot_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
+async def forgot_password(
+    request: Request,  # SECURITY: Required for rate limiting
+    reset_request: PasswordResetRequest, 
+    db: Session = Depends(get_db)
+):
     """
     Request password reset - sends reset token to email
     
     Security: Always returns success (doesn't reveal if email exists)
     """
-    user = get_user_by_email(db, request.email)
+    user = get_user_by_email(db, reset_request.email)
     
     if not user:
         # Don't reveal if email exists - security best practice
@@ -369,8 +390,13 @@ async def forgot_password(request: PasswordResetRequest, db: Session = Depends(g
     }
 
 
+@limiter.limit("5/hour")  # SECURITY: Limit password reset attempts
 @router.post("/reset-password", response_model=MessageResponse)
-async def reset_password(reset_data: PasswordReset, db: Session = Depends(get_db)):
+async def reset_password(
+    request: Request,  # SECURITY: Required for rate limiting
+    reset_data: PasswordReset, 
+    db: Session = Depends(get_db)
+):
     """
     Reset password using token from email
     """

@@ -1,10 +1,13 @@
 """
-Application Configuration - QStash Version
+Application Configuration - QStash Version WITH SECURITY FIXES
 Location: app/core/config.py
+
+Enhanced with proper CORS configuration and security settings
 """
 from pydantic_settings import BaseSettings # type: ignore
 from pydantic import Field # type: ignore
 from typing import List, Optional
+import os
 
 
 class Settings(BaseSettings):
@@ -18,6 +21,12 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
     TEST_DATABASE_URL: Optional[str] = None
+    
+    # Database Pool Settings (for enhanced database.py)
+    DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
+    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "30"))
+    DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+    DB_POOL_RECYCLE: int = int(os.getenv("DB_POOL_RECYCLE", "3600"))
     
     # Security
     SECRET_KEY: str
@@ -60,8 +69,50 @@ class Settings(BaseSettings):
     # ====================================================================
     TESSERACT_CMD: Optional[str] = None
     
-    # CORS
-    BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8000"]
+    # ====================================================================
+    # CORS SETTINGS - SECURITY ENHANCED
+    # ====================================================================
+    @property
+    def BACKEND_CORS_ORIGINS(self) -> List[str]:
+        """
+        Get CORS origins based on environment.
+        
+        SECURITY: Strict origin control based on environment
+        - Production: Only allow specific production domains
+        - Staging: Only allow staging domain
+        - Development: Only allow localhost
+        """
+        if self.ENVIRONMENT == "production":
+            # IMPORTANT: Replace these with your actual production domains
+            return [
+                "https://yourdomain.com",
+                "https://app.yourdomain.com",
+                "https://www.yourdomain.com",
+            ]
+        elif self.ENVIRONMENT == "staging":
+            # IMPORTANT: Replace with your staging domain
+            return [
+                "https://staging.yourdomain.com",
+            ]
+        else:
+            # Development: localhost only
+            return [
+                "http://localhost:3000",
+                "http://localhost:8000",
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:8000",
+            ]
+    
+    # ====================================================================
+    # RATE LIMITING (for rate_limit.py)
+    # ====================================================================
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_STORAGE: str = "memory://"  # Use "redis://localhost:6379" in production
+    
+    # ====================================================================
+    # MONITORING (Optional)
+    # ====================================================================
+    SENTRY_DSN: Optional[str] = None
     
     class Config:
         env_file = ".env"

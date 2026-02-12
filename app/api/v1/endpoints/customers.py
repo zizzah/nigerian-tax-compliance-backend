@@ -1,6 +1,8 @@
 """
 Customer API Endpoints
 Location: app/api/v1/endpoints/customers.py
+
+WITH SECURITY FIXES: Input sanitization
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
 from sqlalchemy.orm import Session # type: ignore
@@ -10,6 +12,7 @@ import math
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.core.sanitizer import sanitizer # type: ignore
 from app.models.user import User # type: ignore
 from app.models.business import Business
 from app.models.customer import Customer
@@ -65,26 +68,41 @@ async def create_customer(
     - **credit_limit**: Maximum credit allowed
     - **payment_terms_days**: Payment terms (default: 30 days)
     - **notes**: Additional notes
+    
+    SECURITY: All text inputs are sanitized to prevent XSS attacks
     """
     business = get_user_business(db, current_user.id) # type: ignore
     
+    # SECURITY: Sanitize email for duplicate check
+    sanitized_email = sanitizer.sanitize_email(customer_data.email) if customer_data.email else None
+    
     # Check for duplicate email (if provided)
-    if customer_data.email:
+    if sanitized_email:
         existing = db.query(Customer).filter(
             Customer.business_id == business.id,
-            Customer.email == customer_data.email
+            Customer.email == sanitized_email
         ).first()
         
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Customer with email {customer_data.email} already exists"
+                detail=f"Customer with email {sanitized_email} already exists"
             )
     
-    # Create customer
+    # SECURITY: Sanitize all text inputs before creating customer
     customer = Customer(
-        **customer_data.model_dump(),
-        business_id=business.id
+        business_id=business.id,
+        name=sanitizer.sanitize_text(customer_data.name, field_type="name"),
+        email=sanitized_email,
+        phone=sanitizer.sanitize_phone(customer_data.phone) if customer_data.phone else None,
+        address=sanitizer.sanitize_text(customer_data.address, field_type="address") if customer_data.address else None,
+        city=sanitizer.sanitize_text(customer_data.city) if customer_data.city else None,
+        state=sanitizer.sanitize_text(customer_data.state) if customer_data.state else None,
+        tin=sanitizer.sanitize_tin(customer_data.tin) if customer_data.tin else None,
+        customer_type=customer_data.customer_type,
+        credit_limit=customer_data.credit_limit,
+        payment_terms_days=customer_data.payment_terms_days,
+        notes=sanitizer.sanitize_text(customer_data.notes, field_type="notes") if customer_data.notes else None,
     )
     
     db.add(customer)
@@ -230,6 +248,8 @@ async def update_customer(
     Update a customer's information.
     
     All fields are optional - only provided fields will be updated.
+    
+    SECURITY: All text inputs are sanitized to prevent XSS attacks
     """
     business = get_user_business(db, current_user.id) # type: ignore
     
@@ -244,22 +264,49 @@ async def update_customer(
             detail="Customer not found"
         )
     
-    # Check for email conflict (if email is being updated)
-    if customer_data.email and customer_data.email != customer.email:
-        existing = db.query(Customer).filter(
-            Customer.business_id == business.id,
-            Customer.email == customer_data.email,
-            Customer.id != customer_id
-        ).first()
+    # Get update data and sanitize text fields
+    update_data = customer_data.model_dump(exclude_unset=True)
+    
+    # SECURITY: Sanitize all text inputs
+    if "name" in update_data:
+        update_data["name"] = sanitizer.sanitize_text(update_data["name"], field_type="name")
+    
+    if "email" in update_data:
+        update_data["email"] = sanitizer.sanitize_email(update_data["email"])
         
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Customer with email {customer_data.email} already exists"
-            )
+        # Check for email conflict (if email is being updated)
+        if update_data["email"] and update_data["email"] != customer.email:
+            existing = db.query(Customer).filter(
+                Customer.business_id == business.id,
+                Customer.email == update_data["email"],
+                Customer.id != customer_id
+            ).first()
+            
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Customer with email {update_data['email']} already exists"
+                )
+    
+    if "phone" in update_data:
+        update_data["phone"] = sanitizer.sanitize_phone(update_data["phone"])
+    
+    if "address" in update_data:
+        update_data["address"] = sanitizer.sanitize_text(update_data["address"], field_type="address")
+    
+    if "city" in update_data:
+        update_data["city"] = sanitizer.sanitize_text(update_data["city"])
+    
+    if "state" in update_data:
+        update_data["state"] = sanitizer.sanitize_text(update_data["state"])
+    
+    if "tin" in update_data:
+        update_data["tin"] = sanitizer.sanitize_tin(update_data["tin"])
+    
+    if "notes" in update_data:
+        update_data["notes"] = sanitizer.sanitize_text(update_data["notes"], field_type="notes")
     
     # Update fields
-    update_data = customer_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(customer, field, value)
     

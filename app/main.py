@@ -3,6 +3,9 @@ FastAPI Main Application with Authentication
 Location: app/main.py
 
 FIXED VERSION - Removed async from health endpoints to prevent timeouts
+WITH SECURITY FIXES: Rate limiting, security headers, HTTPS enforcement
+
+FIX APPLIED: Added SlowAPIMiddleware to enable rate limiting
 """
 from fastapi import FastAPI, Depends # type: ignore
 from fastapi.responses import JSONResponse # type: ignore
@@ -20,8 +23,19 @@ from sqlalchemy.exc import DBAPIError # type: ignore
 import asyncio
 import logging
 
-from app.core.database import get_db
+from app.core.database import get_db, check_database_connection, close_db_connections
 from app.core.config import settings
+
+# SECURITY: Import security middleware and rate limiting
+from app.core.security_middleware import (
+    SecurityHeadersMiddleware,
+    RequestSizeLimitMiddleware, # type: ignore # type: ignore # type: ignore # type: ignore
+    RequestIDMiddleware
+)
+from app.core.rate_limit import limiter, rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded # type: ignore
+from slowapi.middleware import SlowAPIMiddleware # type: ignore  # <-- FIX: Import the middleware
+
 from app.api.v1.endpoints import (
     auth, 
     users, 
@@ -117,16 +131,55 @@ app = FastAPI(
 )
 
 # ============================================================================
-# Middleware Configuration
+# Middleware Configuration - WITH SECURITY FIXES
 # ============================================================================
 
-# CORS Middleware
+# SECURITY: Add rate limiter state (REQUIRED for rate limiting to work)
+app.state.limiter = limiter
+
+# SECURITY: Add rate limit exception handler
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+# ============================================================================
+# FIX: Add SlowAPI Middleware (This was missing!)
+# ============================================================================
+# This middleware is CRITICAL for rate limiting to work.
+# Without it, the @limiter.limit() decorators do nothing!
+app.add_middleware(SlowAPIMiddleware)
+
+# SECURITY 1: Security Headers (all environments)
+app.add_middleware(
+    SecurityHeadersMiddleware,
+    environment=settings.ENVIRONMENT
+)
+
+# SECURITY 2: Request ID (for tracing and debugging)
+app.add_middleware(RequestIDMiddleware)
+
+# SECURITY 3: Request Size Limit (prevent DoS attacks)
+app.add_middleware(
+    RequestSizeLimitMiddleware,
+    max_size_mb=settings.MAX_UPLOAD_SIZE_MB
+)
+
+# SECURITY 4: CORS Middleware - STRICT CONFIGURATION
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_origins=settings.BACKEND_CORS_ORIGINS,  # Strict origins from config
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "User-Agent",
+        "DNT",
+        "Cache-Control",
+        "X-Requested-With",
+    ],
+    max_age=600,  # Cache preflight for 10 minutes
+    expose_headers=["Content-Length", "X-Request-ID"]
 )
 
 # Timeout Middleware - Must be added AFTER CORS
@@ -224,25 +277,25 @@ def health_check(db: Session = Depends(get_db)):
     - General health monitoring
     
     FIXED: Removed async/await and asyncio.to_thread to prevent timeouts
+    ENHANCED: Uses check_database_connection() from enhanced database.py
     NOTE: Redis check removed - migrated to QStash for background tasks
     """
     health_status = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "checks": {}
+        "checks": {},
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT
     }
     
-    # Database check (CRITICAL) - SYNCHRONOUS
-    try:
-        # Direct synchronous call - no async wrapper needed
-        db.execute(text("SELECT 1"))
+    # Database check (CRITICAL) - Using enhanced function
+    if check_database_connection():
         health_status["checks"]["database"] = {"status": "healthy"}
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
+    else:
         health_status["status"] = "unhealthy"
         health_status["checks"]["database"] = {
             "status": "unhealthy",
-            "message": str(e)[:100]
+            "message": "Database connection failed"
         }
         # Return 503 if database is down
         return JSONResponse(status_code=503, content=health_status)
