@@ -1,0 +1,294 @@
+{
+  "timestamp": "2026-02-12T15:10:28.970008",
+  "summary": {
+    "total_tests": 47,
+    "passed": 45,
+    "failed": 1,
+    "warnings": 1,
+    "pass_rate": 95.74468085106383
+  },
+  "results": [
+    {
+      "name": "Root endpoint",
+      "status": "PASS",
+      "message": "Version: 1.0.0",
+      "timestamp": "2026-02-12T15:06:31.108297"
+    },
+    {
+      "name": "Liveness probe",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:06:33.167854"
+    },
+    {
+      "name": "Health check",
+      "status": "PASS",
+      "message": "All systems healthy",
+      "timestamp": "2026-02-12T15:06:40.169132"
+    },
+    {
+      "name": "Readiness probe",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:06:43.378111"
+    },
+    {
+      "name": "User registration",
+      "status": "PASS",
+      "message": "User ID: 0bc5a656-1f37-444f-9bea-e696b95fcee7",
+      "timestamp": "2026-02-12T15:06:48.537676"
+    },
+    {
+      "name": "Login (valid credentials)",
+      "status": "PASS",
+      "message": "Token received",
+      "timestamp": "2026-02-12T15:06:52.494957"
+    },
+    {
+      "name": "Login (wrong password)",
+      "status": "PASS",
+      "message": "Correctly rejected",
+      "timestamp": "2026-02-12T15:06:56.517857"
+    },
+    {
+      "name": "Login (missing password)",
+      "status": "PASS",
+      "message": "Validation error returned",
+      "timestamp": "2026-02-12T15:06:58.644662"
+    },
+    {
+      "name": "Protected endpoint (no token)",
+      "status": "PASS",
+      "message": "Correctly rejected",
+      "timestamp": "2026-02-12T15:07:00.693951"
+    },
+    {
+      "name": "Get user profile",
+      "status": "PASS",
+      "message": "Email: test_b941fdb3@example.com",
+      "timestamp": "2026-02-12T15:07:03.993730"
+    },
+    {
+      "name": "Update user profile",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:07:08.791243"
+    },
+    {
+      "name": "Create business profile",
+      "status": "PASS",
+      "message": "Business ID: 133beea5-9540-4c8f-873e-a7c072e80518",
+      "timestamp": "2026-02-12T15:07:17.206491"
+    },
+    {
+      "name": "Get business profile",
+      "status": "PASS",
+      "message": "Name: Test Business Ltd",
+      "timestamp": "2026-02-12T15:07:20.622065"
+    },
+    {
+      "name": "Update business profile",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:07:25.469022"
+    },
+    {
+      "name": "Get next invoice number",
+      "status": "PASS",
+      "message": "Next: INV-00001",
+      "timestamp": "2026-02-12T15:07:29.304356"
+    },
+    {
+      "name": "Create customer",
+      "status": "PASS",
+      "message": "Customer ID: 0acb2d78-1185-48d5-b088-88fc894a68cb",
+      "timestamp": "2026-02-12T15:07:34.749722"
+    },
+    {
+      "name": "List customers",
+      "status": "PASS",
+      "message": "Total: 1",
+      "timestamp": "2026-02-12T15:07:39.452540"
+    },
+    {
+      "name": "Get customer",
+      "status": "PASS",
+      "message": "Name: Test Customer Inc",
+      "timestamp": "2026-02-12T15:07:43.430936"
+    },
+    {
+      "name": "Update customer",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:07:48.652085"
+    },
+    {
+      "name": "Search customers",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:07:53.025692"
+    },
+    {
+      "name": "Get customer statistics",
+      "status": "PASS",
+      "message": "Total customers: 1",
+      "timestamp": "2026-02-12T15:07:56.716298"
+    },
+    {
+      "name": "Create product",
+      "status": "PASS",
+      "message": "Product ID: 53605650-ba60-4824-b9dc-f247b209a658, SKU: TES-231981",
+      "timestamp": "2026-02-12T15:08:02.102799"
+    },
+    {
+      "name": "List products",
+      "status": "PASS",
+      "message": "Total: 1",
+      "timestamp": "2026-02-12T15:08:06.057152"
+    },
+    {
+      "name": "Get product",
+      "status": "PASS",
+      "message": "Name: Test Product",
+      "timestamp": "2026-02-12T15:08:09.747118"
+    },
+    {
+      "name": "Update product",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:08:14.915762"
+    },
+    {
+      "name": "Search products",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:08:18.881153"
+    },
+    {
+      "name": "Get product categories",
+      "status": "PASS",
+      "message": "Categories: 1",
+      "timestamp": "2026-02-12T15:08:22.587853"
+    },
+    {
+      "name": "Create invoice",
+      "status": "PASS",
+      "message": "Invoice: INV-00001, Total: \u20a6118250.00",
+      "timestamp": "2026-02-12T15:08:30.161624"
+    },
+    {
+      "name": "List invoices",
+      "status": "PASS",
+      "message": "Total: 1",
+      "timestamp": "2026-02-12T15:08:35.127817"
+    },
+    {
+      "name": "Get invoice",
+      "status": "PASS",
+      "message": "Number: INV-00001",
+      "timestamp": "2026-02-12T15:08:39.649173"
+    },
+    {
+      "name": "Update invoice",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:08:46.059693"
+    },
+    {
+      "name": "Finalize invoice",
+      "status": "PASS",
+      "message": "Status: SENT",
+      "timestamp": "2026-02-12T15:08:52.461954"
+    },
+    {
+      "name": "Download invoice PDF",
+      "status": "PASS",
+      "message": "PDF size: 2.8 KB",
+      "timestamp": "2026-02-12T15:08:56.930934"
+    },
+    {
+      "name": "Get invoice statistics",
+      "status": "PASS",
+      "message": "Total invoices: 1",
+      "timestamp": "2026-02-12T15:09:01.439476"
+    },
+    {
+      "name": "Create payment",
+      "status": "PASS",
+      "message": "Payment ID: 5e22118c-4c74-4cee-a166-4a3352f2f6fe, Receipt: INV-20260212140905",
+      "timestamp": "2026-02-12T15:09:09.152848"
+    },
+    {
+      "name": "List payments",
+      "status": "PASS",
+      "message": "Total: 1",
+      "timestamp": "2026-02-12T15:09:13.092848"
+    },
+    {
+      "name": "Get payment",
+      "status": "PASS",
+      "message": "Amount: \u20a650000.00",
+      "timestamp": "2026-02-12T15:09:16.787968"
+    },
+    {
+      "name": "Filter payments by invoice",
+      "status": "PASS",
+      "message": "",
+      "timestamp": "2026-02-12T15:09:20.687764"
+    },
+    {
+      "name": "Rate limiting",
+      "status": "WARN",
+      "message": "Rate limit not triggered in 10 attempts (may need adjustment)",
+      "timestamp": "2026-02-12T15:09:54.852725"
+    },
+    {
+      "name": "XSS protection",
+      "status": "PASS",
+      "message": "Script tags stripped",
+      "timestamp": "2026-02-12T15:09:59.911192"
+    },
+    {
+      "name": "SQL injection protection",
+      "status": "PASS",
+      "message": "SQL injection attempt handled safely",
+      "timestamp": "2026-02-12T15:10:08.245069"
+    },
+    {
+      "name": "Authorization check",
+      "status": "PASS",
+      "message": "Cannot access non-existent/unauthorized resources",
+      "timestamp": "2026-02-12T15:10:12.278310"
+    },
+    {
+      "name": "List endpoint response time",
+      "status": "FAIL",
+      "message": "3872ms (too slow for production)",
+      "timestamp": "2026-02-12T15:10:16.171634"
+    },
+    {
+      "name": "Database connection pool",
+      "status": "PASS",
+      "message": "Healthy",
+      "timestamp": "2026-02-12T15:10:19.352649"
+    },
+    {
+      "name": "Email validation",
+      "status": "PASS",
+      "message": "Invalid email rejected",
+      "timestamp": "2026-02-12T15:10:22.556313"
+    },
+    {
+      "name": "Price validation",
+      "status": "PASS",
+      "message": "Negative price rejected",
+      "timestamp": "2026-02-12T15:10:25.717128"
+    },
+    {
+      "name": "Required fields validation",
+      "status": "PASS",
+      "message": "Missing required field rejected",
+      "timestamp": "2026-02-12T15:10:28.970008"
+    }
+  ]
+}
