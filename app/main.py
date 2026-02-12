@@ -30,7 +30,8 @@ from app.api.v1.endpoints import (
     invoices, 
     products, 
     payments,
-    documents
+    documents,
+    background  # QStash callback endpoint
 )
 from app.core.exceptions import (
     http_exception_handler,
@@ -143,6 +144,7 @@ app.include_router(invoices.router, prefix=settings.API_V1_PREFIX)
 app.include_router(products.router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments.router, prefix=settings.API_V1_PREFIX)
 app.include_router(documents.router, prefix=settings.API_V1_PREFIX)
+app.include_router(background.router, prefix=settings.API_V1_PREFIX)  # QStash callbacks
 
 # ============================================================================
 # Exception Handlers
@@ -211,11 +213,9 @@ def health_check(db: Session = Depends(get_db)):
     
     Checks:
     - Database connectivity (synchronous)
-    - Redis connectivity (synchronous)
     
     Returns:
     - 200: Healthy (all critical systems operational)
-    - 200: Degraded (Redis down, API still functional)
     - 503: Unhealthy (database down, API cannot function)
     
     Use this for:
@@ -224,6 +224,7 @@ def health_check(db: Session = Depends(get_db)):
     - General health monitoring
     
     FIXED: Removed async/await and asyncio.to_thread to prevent timeouts
+    NOTE: Redis check removed - migrated to QStash for background tasks
     """
     health_status = {
         "status": "healthy",
@@ -245,22 +246,6 @@ def health_check(db: Session = Depends(get_db)):
         }
         # Return 503 if database is down
         return JSONResponse(status_code=503, content=health_status)
-    
-    # Redis check (NON-CRITICAL) - SYNCHRONOUS
-    try:
-        import redis # type: ignore
-        client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2, ssl=True, ssl_cert_reqs='none')
-        client.ping()
-        client.close()
-        health_status["checks"]["redis"] = {"status": "healthy"}
-    except Exception as e:
-        logger.warning(f"Redis health check failed: {e}")
-        if health_status["status"] == "healthy":
-            health_status["status"] = "degraded"
-        health_status["checks"]["redis"] = {
-            "status": "degraded",
-            "message": "Redis unavailable"
-        }
     
     return health_status
 

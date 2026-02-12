@@ -29,21 +29,22 @@ python-dotenv==1.0.1
 # ===============================
 # BACKGROUND TASKS - QSTASH (REPLACES CELERY)
 # ===============================
-upstash-qstash
+# NOTE: The correct package name is 'qstash' not 'upstash-qstash'
+qstash==2.0.2
 
 # ===============================
 # AI & OCR
 # ===============================
-groq
-pytesseract
-Pillow
-opencv-python-headless
-numpy
+groq==0.11.0
+pytesseract==0.3.13
+Pillow==10.2.0
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
 
 # ===============================
 # PDF GENERATION
 # ===============================
-reportlab
+reportlab==4.0.9
 
 # ===============================
 # EMAIL
