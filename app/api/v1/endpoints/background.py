@@ -3,7 +3,6 @@ Background Task Endpoint (QStash Callback)
 Location: app/api/v1/endpoints/background.py
 """
 from fastapi import APIRouter, Request, HTTPException, Depends # type: ignore
-from qstash import verify # type: ignore
 from sqlalchemy.orm import Session # type: ignore
 from app.core.config import settings
 from app.core.database import get_db
@@ -33,6 +32,41 @@ def convert_decimals(obj):
     return obj
 
 
+def verify_qstash_signature(request: Request, body: bytes) -> bool:
+    """
+    Verify that the request came from QStash
+    
+    QStash signs each request with your signing keys.
+    We verify the signature to ensure the request is authentic.
+    """
+    try:
+        from qstash import Receiver # type: ignore
+        
+        # Create receiver with your signing keys
+        receiver = Receiver(
+            current_signing_key=settings.QSTASH_CURRENT_SIGNING_KEY,
+            next_signing_key=settings.QSTASH_NEXT_SIGNING_KEY
+        )
+        
+        # Get signature from header
+        signature = request.headers.get("Upstash-Signature")
+        if not signature:
+            logger.error("No Upstash-Signature header found")
+            return False
+        
+        # Verify the signature
+        receiver.verify(
+            signature=signature,
+            body=body.decode('utf-8')
+        )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"QStash signature verification failed: {e}")
+        return False
+
+
 @router.post("/process-document")
 async def process_document(request: Request, db: Session = Depends(get_db)):
     """
@@ -45,23 +79,9 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
     # ====================================================================
     
     body = await request.body()
-    signature = request.headers.get("Upstash-Signature")
     
-    # Verify signature using QStash's verify function
-    try:
-        is_valid = verify(
-            signature=signature,
-            signing_keys=[
-                settings.QSTASH_CURRENT_SIGNING_KEY,
-                settings.QSTASH_NEXT_SIGNING_KEY
-            ],
-            body=body.decode('utf-8')
-        )
-    except Exception as e:
-        logger.error(f"QStash signature verification failed: {e}")
-        raise HTTPException(status_code=401, detail="Invalid QStash signature")
-    
-    if not is_valid:
+    # Verify signature
+    if not verify_qstash_signature(request, body):
         raise HTTPException(status_code=401, detail="Invalid QStash signature")
     
     # ====================================================================
