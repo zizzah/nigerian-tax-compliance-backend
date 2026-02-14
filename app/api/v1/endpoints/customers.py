@@ -3,16 +3,20 @@ Customer API Endpoints
 Location: app/api/v1/endpoints/customers.py
 
 WITH SECURITY FIXES: Input sanitization
+PRODUCTION OPTIMIZED: Enhanced pagination, search, and query optimization
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request # type: ignore
 from sqlalchemy.orm import Session # type: ignore
-from typing import Optional
+from sqlalchemy import func, or_ # type: ignore
+from typing import Optional, List
 import uuid
 import math
+import logging
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.core.sanitizer import sanitizer # type: ignore
+from app.core.config import settings
 from app.models.user import User # type: ignore
 from app.models.business import Business
 from app.models.customer import Customer
@@ -25,6 +29,7 @@ from app.schemas.customer import (
 )
 
 router = APIRouter(prefix="/customers", tags=["Customers"])
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -43,7 +48,7 @@ def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
 
 
 # ============================================================================
-# Customer CRUD Endpoints
+# Customer CRUD Endpoints - PRODUCTION OPTIMIZED
 # ============================================================================
 
 @router.post("/", response_model=CustomerResponse, status_code=status.HTTP_201_CREATED)
@@ -69,111 +74,234 @@ async def create_customer(
     - **payment_terms_days**: Payment terms (default: 30 days)
     - **notes**: Additional notes
     
-    SECURITY: All text inputs are sanitized to prevent XSS attacks
+    **Security:** All text inputs are sanitized to prevent XSS attacks
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    # SECURITY: Sanitize email for duplicate check
-    sanitized_email = sanitizer.sanitize_email(customer_data.email) if customer_data.email else None
-    
-    # Check for duplicate email (if provided)
-    if sanitized_email:
-        existing = db.query(Customer).filter(
-            Customer.business_id == business.id,
-            Customer.email == sanitized_email
-        ).first()
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
         
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Customer with email {sanitized_email} already exists"
-            )
-    
-    # SECURITY: Sanitize all text inputs before creating customer
-    customer = Customer(
-        business_id=business.id,
-        name=sanitizer.sanitize_text(customer_data.name, field_type="name"),
-        email=sanitized_email,
-        phone=sanitizer.sanitize_phone(customer_data.phone) if customer_data.phone else None,
-        address=sanitizer.sanitize_text(customer_data.address, field_type="address") if customer_data.address else None,
-        city=sanitizer.sanitize_text(customer_data.city) if customer_data.city else None,
-        state=sanitizer.sanitize_text(customer_data.state) if customer_data.state else None,
-        tin=sanitizer.sanitize_tin(customer_data.tin) if customer_data.tin else None,
-        customer_type=customer_data.customer_type,
-        credit_limit=customer_data.credit_limit,
-        payment_terms_days=customer_data.payment_terms_days,
-        notes=sanitizer.sanitize_text(customer_data.notes, field_type="notes") if customer_data.notes else None,
-    )
-    
-    db.add(customer)
-    db.commit()
-    db.refresh(customer)
-    
-    return customer
+        # SECURITY: Sanitize email for duplicate check
+        sanitized_email = sanitizer.sanitize_email(customer_data.email) if customer_data.email else None
+        
+        # Check for duplicate email (if provided)
+        if sanitized_email:
+            existing = db.query(Customer).filter(
+                Customer.business_id == business.id,
+                Customer.email == sanitized_email
+            ).first()
+            
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Customer with email {sanitized_email} already exists"
+                )
+        
+        # SECURITY: Sanitize all text inputs before creating customer
+        customer = Customer(
+            business_id=business.id,
+            name=sanitizer.sanitize_text(customer_data.name, field_type="name"),
+            email=sanitized_email,
+            phone=sanitizer.sanitize_phone(customer_data.phone) if customer_data.phone else None,
+            address=sanitizer.sanitize_text(customer_data.address, field_type="address") if customer_data.address else None,
+            city=sanitizer.sanitize_text(customer_data.city) if customer_data.city else None,
+            state=sanitizer.sanitize_text(customer_data.state) if customer_data.state else None,
+            tin=sanitizer.sanitize_tin(customer_data.tin) if customer_data.tin else None,
+            customer_type=customer_data.customer_type,
+            credit_limit=customer_data.credit_limit,
+            payment_terms_days=customer_data.payment_terms_days,
+            notes=sanitizer.sanitize_text(customer_data.notes, field_type="notes") if customer_data.notes else None,
+        )
+        
+        db.add(customer)
+        db.commit()
+        db.refresh(customer)
+        
+        logger.info(f"Customer created: {customer.id} by user {current_user.id}")
+        
+        return customer
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating customer: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error creating customer"
+        )
 
 
 @router.get("/", response_model=CustomerListResponse)
 async def list_customers(
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=100, description="Items per page"),
+    request: Request,
+    skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
+    limit: int = Query(
+        default=settings.DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=settings.MAX_PAGE_SIZE,
+        description=f"Maximum number of records to return (max: {settings.MAX_PAGE_SIZE})"
+    ),
     search: Optional[str] = Query(None, description="Search by name, email, or phone"),
     customer_type: Optional[str] = Query(None, description="Filter by customer type"),
     is_active: Optional[bool] = Query(None, description="Filter by active status"),
+    sort_by: str = Query("created_at", description="Field to sort by"),
+    sort_order: str = Query("desc", regex="^(asc|desc)$", description="Sort order"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Get a paginated list of customers.
+    Get a paginated list of customers - PRODUCTION OPTIMIZED
+    
+    **Performance:** Optimized with pagination, filtering, and efficient queries
     
     **Query Parameters:**
-    - **page**: Page number (default: 1)
-    - **page_size**: Items per page (max: 100, default: 50)
+    - **skip**: Offset for pagination (default: 0)
+    - **limit**: Items per page (default: 50, max: 1000)
     - **search**: Search in name, email, or phone
     - **customer_type**: Filter by "Individual" or "Business"
     - **is_active**: Filter by active status
+    - **sort_by**: Field to sort by (default: created_at)
+    - **sort_order**: "asc" or "desc" (default: desc)
     
-    **Returns**: Paginated list with metadata
+    **Returns:** Paginated list with metadata
+    - items: List of customers
+    - total: Total count of customers matching filters
+    - page: Current page number
+    - per_page: Items per page
+    - total_pages: Total number of pages
+    - has_next: Whether there are more pages
+    - has_prev: Whether there are previous pages
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    # Base query
-    query = db.query(Customer).filter(Customer.business_id == business.id)
-    
-    # Apply filters
-    if search:
-        search_term = f"%{search}%"
-        query = query.filter(
-            (Customer.name.ilike(search_term)) |
-            (Customer.email.ilike(search_term)) |
-            (Customer.phone.ilike(search_term))
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        # Base query - optimized with proper filtering
+        query = db.query(Customer).filter(Customer.business_id == business.id)
+        
+        # Apply search filter with ILIKE for case-insensitive search
+        if search:
+            search_term = f"%{search}%"
+            query = query.filter(
+                or_(
+                    Customer.name.ilike(search_term),
+                    Customer.email.ilike(search_term),
+                    Customer.phone.ilike(search_term)
+                )
+            )
+        
+        # Apply customer type filter
+        if customer_type:
+            query = query.filter(Customer.customer_type == customer_type)
+        
+        # Apply active status filter
+        if is_active is not None:
+            query = query.filter(Customer.is_active == is_active)
+        
+        # Get total count BEFORE pagination (for metadata)
+        total = query.count()
+        
+        # Apply sorting
+        if hasattr(Customer, sort_by):
+            if sort_order == "desc":
+                query = query.order_by(getattr(Customer, sort_by).desc())
+            else:
+                query = query.order_by(getattr(Customer, sort_by).asc())
+        else:
+            # Default sort if field doesn't exist
+            query = query.order_by(Customer.created_at.desc())
+        
+        # Apply pagination - CRITICAL for performance
+        customers = query.offset(skip).limit(limit).all()
+        
+        # Calculate pagination metadata
+        total_pages = math.ceil(total / limit) if limit > 0 else 0
+        current_page = (skip // limit) + 1 if limit > 0 else 1
+        
+        logger.debug(
+            f"Listed customers: total={total}, page={current_page}, "
+            f"limit={limit}, search={search}"
         )
+        
+        return {
+            "customers": customers,
+            "total": total,
+            "page": current_page,
+            "page_size": limit,
+            "total_pages": total_pages,
+            "has_next": skip + limit < total,
+            "has_prev": skip > 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing customers: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error retrieving customers"
+        )
+
+
+@router.get("/search", response_model=List[CustomerSummary])
+async def search_customers(
+    q: str = Query(..., min_length=2, description="Search query (min 2 chars)"),
+    limit: int = Query(20, ge=1, le=100, description="Max results to return"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Quick customer search - OPTIMIZED for autocomplete/typeahead
     
-    if customer_type:
-        query = query.filter(Customer.customer_type == customer_type)
+    **Performance:** Lightweight query with minimal fields for fast response
     
-    if is_active is not None:
-        query = query.filter(Customer.is_active == is_active)
+    **Use Cases:**
+    - Autocomplete dropdowns
+    - Typeahead search
+    - Quick customer selection
     
-    # Get total count
-    total = query.count()
+    **Args:**
+    - **q**: Search query (minimum 2 characters)
+    - **limit**: Maximum results (default: 20, max: 100)
     
-    # Calculate pagination
-    total_pages = math.ceil(total / page_size)
-    offset = (page - 1) * page_size
-    
-    # Get paginated results
-    customers = query.order_by(Customer.created_at.desc())\
-        .offset(offset)\
-        .limit(page_size)\
-        .all()
-    
-    return {
-        "customers": customers,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages
-    }
+    **Returns:** Lightweight customer summaries with essential fields only
+    """
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        search_term = f"%{q}%"
+        
+        # Optimized query - only active customers
+        customers = db.query(Customer)\
+            .filter(Customer.business_id == business.id)\
+            .filter(Customer.is_active == True)\
+            .filter(
+                or_(
+                    Customer.name.ilike(search_term),
+                    Customer.email.ilike(search_term),
+                    Customer.phone.ilike(search_term)
+                )
+            )\
+            .order_by(Customer.name)\
+            .limit(limit)\
+            .all()
+        
+        # Return lightweight summaries
+        return [
+            {
+                "id": c.id,
+                "name": c.name,
+                "email": c.email,
+                "phone": c.phone,
+                "total_invoices_count": c.total_invoices_count,
+                "outstanding_amount": c.outstanding_amount,
+                "is_active": c.is_active
+            }
+            for c in customers
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error searching customers: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error searching customers"
+        )
 
 
 @router.get("/summary", response_model=list[CustomerSummary])
@@ -185,7 +313,7 @@ async def list_customers_summary(
     """
     Get a lightweight summary of customers (for dropdowns, autocomplete, etc.)
     
-    Returns only essential fields for better performance.
+    **Performance:** Returns only essential fields for better performance
     """
     business = get_user_business(db, current_user.id) # type: ignore
     
@@ -249,71 +377,84 @@ async def update_customer(
     
     All fields are optional - only provided fields will be updated.
     
-    SECURITY: All text inputs are sanitized to prevent XSS attacks
+    **Security:** All text inputs are sanitized to prevent XSS attacks
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id,
-        Customer.business_id == business.id
-    ).first()
-    
-    if not customer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Customer not found"
-        )
-    
-    # Get update data and sanitize text fields
-    update_data = customer_data.model_dump(exclude_unset=True)
-    
-    # SECURITY: Sanitize all text inputs
-    if "name" in update_data:
-        update_data["name"] = sanitizer.sanitize_text(update_data["name"], field_type="name")
-    
-    if "email" in update_data:
-        update_data["email"] = sanitizer.sanitize_email(update_data["email"])
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
         
-        # Check for email conflict (if email is being updated)
-        if update_data["email"] and update_data["email"] != customer.email:
-            existing = db.query(Customer).filter(
-                Customer.business_id == business.id,
-                Customer.email == update_data["email"],
-                Customer.id != customer_id
-            ).first()
+        customer = db.query(Customer).filter(
+            Customer.id == customer_id,
+            Customer.business_id == business.id
+        ).first()
+        
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Customer not found"
+            )
+        
+        # Get update data and sanitize text fields
+        update_data = customer_data.model_dump(exclude_unset=True)
+        
+        # SECURITY: Sanitize all text inputs
+        if "name" in update_data:
+            update_data["name"] = sanitizer.sanitize_text(update_data["name"], field_type="name")
+        
+        if "email" in update_data:
+            update_data["email"] = sanitizer.sanitize_email(update_data["email"])
             
-            if existing:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Customer with email {update_data['email']} already exists"
-                )
-    
-    if "phone" in update_data:
-        update_data["phone"] = sanitizer.sanitize_phone(update_data["phone"])
-    
-    if "address" in update_data:
-        update_data["address"] = sanitizer.sanitize_text(update_data["address"], field_type="address")
-    
-    if "city" in update_data:
-        update_data["city"] = sanitizer.sanitize_text(update_data["city"])
-    
-    if "state" in update_data:
-        update_data["state"] = sanitizer.sanitize_text(update_data["state"])
-    
-    if "tin" in update_data:
-        update_data["tin"] = sanitizer.sanitize_tin(update_data["tin"])
-    
-    if "notes" in update_data:
-        update_data["notes"] = sanitizer.sanitize_text(update_data["notes"], field_type="notes")
-    
-    # Update fields
-    for field, value in update_data.items():
-        setattr(customer, field, value)
-    
-    db.commit()
-    db.refresh(customer)
-    
-    return customer
+            # Check for email conflict (if email is being updated)
+            if update_data["email"] and update_data["email"] != customer.email:
+                existing = db.query(Customer).filter(
+                    Customer.business_id == business.id,
+                    Customer.email == update_data["email"],
+                    Customer.id != customer_id
+                ).first()
+                
+                if existing:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Customer with email {update_data['email']} already exists"
+                    )
+        
+        if "phone" in update_data:
+            update_data["phone"] = sanitizer.sanitize_phone(update_data["phone"])
+        
+        if "address" in update_data:
+            update_data["address"] = sanitizer.sanitize_text(update_data["address"], field_type="address")
+        
+        if "city" in update_data:
+            update_data["city"] = sanitizer.sanitize_text(update_data["city"])
+        
+        if "state" in update_data:
+            update_data["state"] = sanitizer.sanitize_text(update_data["state"])
+        
+        if "tin" in update_data:
+            update_data["tin"] = sanitizer.sanitize_tin(update_data["tin"])
+        
+        if "notes" in update_data:
+            update_data["notes"] = sanitizer.sanitize_text(update_data["notes"], field_type="notes")
+        
+        # Update fields
+        for field, value in update_data.items():
+            setattr(customer, field, value)
+        
+        db.commit()
+        db.refresh(customer)
+        
+        logger.info(f"Customer updated: {customer_id} by user {current_user.id}")
+        
+        return customer
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating customer: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error updating customer"
+        )
 
 
 @router.delete("/{customer_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -330,24 +471,37 @@ async def delete_customer(
     
     To permanently delete, use DELETE /customers/{id}/permanent
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id,
-        Customer.business_id == business.id
-    ).first()
-    
-    if not customer:
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        customer = db.query(Customer).filter(
+            Customer.id == customer_id,
+            Customer.business_id == business.id
+        ).first()
+        
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Customer not found"
+            )
+        
+        # Soft delete
+        customer.is_active = False # type: ignore
+        db.commit()
+        
+        logger.info(f"Customer soft deleted: {customer_id} by user {current_user.id}")
+        
+        return None
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting customer: {e}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Customer not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting customer"
         )
-    
-    # Soft delete
-    customer.is_active = False # type: ignore
-    db.commit()
-    
-    return None
 
 
 @router.delete("/{customer_id}/permanent", status_code=status.HTTP_204_NO_CONTENT)
@@ -366,36 +520,49 @@ async def permanently_delete_customer(
     
     Use with caution! Consider soft delete instead.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id,
-        Customer.business_id == business.id
-    ).first()
-    
-    if not customer:
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        customer = db.query(Customer).filter(
+            Customer.id == customer_id,
+            Customer.business_id == business.id
+        ).first()
+        
+        if not customer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Customer not found"
+            )
+        
+        # Check if customer has invoices
+        if customer.total_invoices_count > 0: # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot delete customer with {customer.total_invoices_count} invoice(s). "
+                       "Use soft delete instead or delete all invoices first."
+            )
+        
+        # Permanent delete
+        db.delete(customer)
+        db.commit()
+        
+        logger.info(f"Customer permanently deleted: {customer_id} by user {current_user.id}")
+        
+        return None
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error permanently deleting customer: {e}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Customer not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting customer"
         )
-    
-    # Check if customer has invoices
-    if customer.total_invoices_count > 0: # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot delete customer with {customer.total_invoices_count} invoice(s). "
-                   "Use soft delete instead or delete all invoices first."
-        )
-    
-    # Permanent delete
-    db.delete(customer)
-    db.commit()
-    
-    return None
 
 
 # ============================================================================
-# Customer Statistics
+# Customer Statistics - PRODUCTION OPTIMIZED
 # ============================================================================
 
 @router.get("/stats/overview")
@@ -406,47 +573,76 @@ async def get_customer_statistics(
     """
     Get overview statistics about customers.
     
-    Returns:
+    **Performance:** 
+    - For < 1000 customers: Fast (sorts in Python)
+    - For > 1000 customers: Consider adding database columns for aggregates
+    
+    **Returns:**
     - Total customers
     - Active customers
     - Top customers by revenue
     - Average payment days
+    
+    **Note:** total_invoiced_amount and average_payment_days are computed 
+    properties, so sorting is done in Python rather than SQL.
     """
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    # Get all customers
-    customers = db.query(Customer).filter(
-        Customer.business_id == business.id
-    ).all()
-    
-    # Calculate stats
-    total_customers = len(customers)
-    active_customers = len([c for c in customers if c.is_active]) # type: ignore
-    
-    # Top customers by total invoiced amount
-    top_customers = sorted(
-        customers,
-        key=lambda c: float(c.total_invoiced_amount), # type: ignore
-        reverse=True
-    )[:5]
-    
-    # Average payment days (excluding None values)
-    payment_days = [c.average_payment_days for c in customers if c.average_payment_days] # type: ignore
-    avg_payment_days = sum(payment_days) / len(payment_days) if payment_days else None
-    
-    return {
-        "total_customers": total_customers,
-        "active_customers": active_customers,
-        "inactive_customers": total_customers - active_customers,
-        "average_payment_days": avg_payment_days,
-        "top_customers": [
-            {
-                "id": c.id,
-                "name": c.name,
-                "total_invoiced": float(c.total_invoiced_amount), # type: ignore
-                "total_paid": float(c.total_paid_amount), # type: ignore
-                "outstanding": float(c.outstanding_amount)
-            }
-            for c in top_customers
+    try:
+        business = get_user_business(db, current_user.id) # type: ignore
+        
+        # Optimized aggregation query
+        stats = db.query(
+            func.count(Customer.id).label('total'),
+            func.count(Customer.id).filter(Customer.is_active == True).label('active')
+        ).filter(
+            Customer.business_id == business.id
+        ).first()
+        
+        total_customers = stats.total or 0
+        active_customers = stats.active or 0
+        
+        # Get all customers for sorting by computed properties
+        # Note: total_invoiced_amount is a computed property, not a DB column,
+        # so we need to sort in Python, not in SQL
+        all_customers = db.query(Customer)\
+            .filter(Customer.business_id == business.id)\
+            .all()
+        
+        # Sort by total invoiced amount (computed property) in Python
+        top_customers = sorted(
+            all_customers,
+            key=lambda c: float(c.total_invoiced_amount) if c.total_invoiced_amount else 0, # type: ignore
+            reverse=True
+        )[:5]
+        
+        # Average payment days - get all values and calculate in Python
+        # (safer than SQL aggregation for computed properties)
+        payment_days = [
+            float(c.average_payment_days) # type: ignore
+            for c in all_customers 
+            if c.average_payment_days is not None # type: ignore
         ]
-    }
+        avg_payment_days = sum(payment_days) / len(payment_days) if payment_days else None
+        
+        return {
+            "total_customers": total_customers,
+            "active_customers": active_customers,
+            "inactive_customers": total_customers - active_customers,
+            "average_payment_days": avg_payment_days,
+            "top_customers": [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "total_invoiced": float(c.total_invoiced_amount) if c.total_invoiced_amount else 0.0, # type: ignore
+                    "total_paid": float(c.total_paid_amount) if c.total_paid_amount else 0.0, # type: ignore
+                    "outstanding": float(c.outstanding_amount) if c.outstanding_amount else 0.0 # type: ignore
+                }
+                for c in top_customers
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting customer statistics: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error retrieving statistics"
+        )

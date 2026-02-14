@@ -3,6 +3,7 @@ Application Configuration - QStash Version WITH SECURITY FIXES
 Location: app/core/config.py
 
 Enhanced with proper CORS configuration and security settings
+PRODUCTION OPTIMIZED: Added rate limiting, pagination, and Nigerian tax settings
 """
 from pydantic_settings import BaseSettings # type: ignore
 from pydantic import Field # type: ignore
@@ -104,15 +105,29 @@ class Settings(BaseSettings):
             ]
     
     # ====================================================================
-    # RATE LIMITING (for rate_limit.py)
+    # RATE LIMITING - PRODUCTION OPTIMIZED
     # ====================================================================
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_STORAGE: str = "memory://"  # Use "redis://localhost:6379" in production
+    RATE_LIMIT_PER_MINUTE: int = 200  # Global rate limit
+    
+    # ====================================================================
+    # PAGINATION SETTINGS - NEW
+    # ====================================================================
+    DEFAULT_PAGE_SIZE: int = 50
+    MAX_PAGE_SIZE: int = 1000
+    
+    # ====================================================================
+    # NIGERIAN TAX SETTINGS - NEW
+    # ====================================================================
+    VAT_RATE: float = 0.075  # 7.5%
+    WHT_RATE: float = 0.05   # 5%
     
     # ====================================================================
     # MONITORING (Optional)
     # ====================================================================
     SENTRY_DSN: Optional[str] = None
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
     class Config:
         env_file = ".env"
