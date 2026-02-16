@@ -4,11 +4,12 @@ Location: app/api/v1/endpoints/invoices.py
 
 Includes all CRUD operations + PDF generation
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from fastapi.responses import Response
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, func
-from sqlalchemy.exc import IntegrityError
+from asyncio.log import logger
+from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
+from fastapi.responses import Response # type: ignore
+from sqlalchemy.orm import Session  # type: ignore
+from sqlalchemy import or_, and_, func # type: ignore
+from sqlalchemy.exc import IntegrityError  # type: ignore
 from typing import Optional
 import uuid
 import math
@@ -81,41 +82,67 @@ def verify_customer_belongs_to_business(db: Session, customer_id: uuid.UUID, bus
     return customer
 
 
+
+
+
+
+# Replace the generate_unique_invoice_number function with this:
+
 def generate_unique_invoice_number(db: Session, business: Business, max_retries: int = 5) -> str:
     """
-    Generate a unique invoice number with retry logic
-    
-    This handles the edge case where:
-    1. Two requests try to create invoices simultaneously
-    2. Counter is out of sync with database
-    3. Failed transaction didn't increment counter
+    Generate unique invoice number with database locking (RACE CONDITION FIX)
     """
-    for attempt in range(max_retries):
-        # Get the invoice number
-        invoice_number = business.get_next_invoice_number()
-        
-        # Check if it already exists
-        existing = db.query(Invoice).filter(
-            Invoice.invoice_number == invoice_number
-        ).first()
-        
-        if not existing:
-            # Great! This number is available
-            return invoice_number
-        
-        # Number exists - increment counter and try again
-        print(f"⚠️  Invoice number {invoice_number} already exists (attempt {attempt + 1}/{max_retries})")
-        business.invoice_counter += 1
-        
-        # Small delay to avoid race conditions
-        if attempt < max_retries - 1:
-            time.sleep(0.1)
+    from app.models.business import Business as BusinessModel
     
-    # If we get here, we failed to generate a unique number
+    for attempt in range(max_retries):
+        try:
+            # CRITICAL FIX: Lock business row to prevent race conditions
+            locked_business = db.query(BusinessModel)\
+                .filter(BusinessModel.id == business.id)\
+                .with_for_update()\
+                .first()
+            
+            if not locked_business:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Business not found"
+                )
+            
+            # Generate number
+            invoice_number = f"{locked_business.invoice_prefix}-{str(locked_business.invoice_counter + 1).zfill(5)}"
+            
+            # Check if exists (shouldn't with locking, but be safe)
+            existing = db.query(Invoice).filter(
+                Invoice.invoice_number == invoice_number
+            ).first()
+            
+            if existing:
+                locked_business.invoice_counter += 1
+                db.commit()
+                if attempt < max_retries - 1:
+                    time.sleep(0.1)
+                continue
+            
+            # SUCCESS: Increment and commit BEFORE returning
+            locked_business.invoice_counter += 1
+            business.invoice_counter = locked_business.invoice_counter
+            db.commit()
+            
+            logger.info(f"Generated invoice number: {invoice_number}")
+            return invoice_number
+            
+        except Exception as e:
+            logger.error(f"Error generating invoice number (attempt {attempt + 1}): {e}")
+            db.rollback()
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+    
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Failed to generate unique invoice number after {max_retries} attempts. Please try again."
+        detail=f"Failed to generate unique invoice number after {max_retries} attempts"
     )
+
 
 
 def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Customer) -> BytesIO:
