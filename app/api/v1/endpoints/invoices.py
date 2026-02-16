@@ -35,6 +35,12 @@ from app.schemas.invoice import (
     InvoiceCancelRequest,
     InvoiceStatistics
 )
+from sqlalchemy import select # type: ignore
+from app.models.business import Business as BusinessModel
+from app.models.invoice import Invoice
+import logging
+import time
+
 
 # PDF Generation imports
 try:
@@ -88,19 +94,27 @@ def verify_customer_belongs_to_business(db: Session, customer_id: uuid.UUID, bus
 
 # Replace the generate_unique_invoice_number function with this:
 
-def generate_unique_invoice_number(db: Session, business: Business, max_retries: int = 5) -> str:
+
+def generate_unique_invoice_number(db: Session, business: Business, max_retries: int = 10) -> str:
     """
-    Generate unique invoice number with database locking (RACE CONDITION FIX)
+    Generate unique invoice number with database locking (IMPROVED - handles existing duplicates)
+    
+    This function:
+    1. Prevents race conditions using SELECT FOR UPDATE
+    2. Skips over existing duplicate invoice numbers from previous runs
+    3. Automatically finds the next available number
     """
-    from app.models.business import Business as BusinessModel
+    
+    logger = logging.getLogger(__name__)
     
     for attempt in range(max_retries):
         try:
-            # CRITICAL FIX: Lock business row to prevent race conditions
-            locked_business = db.query(BusinessModel)\
-                .filter(BusinessModel.id == business.id)\
-                .with_for_update()\
-                .first()
+            # Lock business row to prevent race conditions
+            stmt = select(BusinessModel).where(
+                BusinessModel.id == business.id
+            ).with_for_update()
+            
+            locked_business = db.execute(stmt).scalar_one_or_none()
             
             if not locked_business:
                 raise HTTPException(
@@ -108,42 +122,56 @@ def generate_unique_invoice_number(db: Session, business: Business, max_retries:
                     detail="Business not found"
                 )
             
-            # Generate number
-            invoice_number = f"{locked_business.invoice_prefix}-{str(locked_business.invoice_counter + 1).zfill(5)}"
+            # Increment counter
+            locked_business.invoice_counter += 1
+            next_counter = locked_business.invoice_counter
             
-            # Check if exists (shouldn't with locking, but be safe)
+            # Generate invoice number
+            invoice_number = f"{locked_business.invoice_prefix}-{str(next_counter).zfill(5)}"
+            
+            # ================================================================
+            # NEW: Check if this number already exists (from old duplicates)
+            # ================================================================
             existing = db.query(Invoice).filter(
                 Invoice.invoice_number == invoice_number
             ).first()
             
             if existing:
-                locked_business.invoice_counter += 1
+                # Duplicate found! Log warning and continue to next number
+                logger.warning(
+                    f"Invoice number {invoice_number} already exists (from previous run). "
+                    f"Skipping to next number... (attempt {attempt + 1}/{max_retries})"
+                )
+                # Commit the incremented counter and try again
                 db.commit()
-                if attempt < max_retries - 1:
-                    time.sleep(0.1)
+                time.sleep(0.05)
                 continue
             
-            # SUCCESS: Increment and commit BEFORE returning
-            locked_business.invoice_counter += 1
-            business.invoice_counter = locked_business.invoice_counter
+            # ================================================================
+            # Number is unique - commit and return
+            # ================================================================
             db.commit()
+            business.invoice_counter = next_counter
             
-            logger.info(f"Generated invoice number: {invoice_number}")
+            logger.info(f"✓ Generated unique invoice number: {invoice_number}")
             return invoice_number
             
         except Exception as e:
-            logger.error(f"Error generating invoice number (attempt {attempt + 1}): {e}")
+            logger.error(f"Error generating invoice number (attempt {attempt + 1}/{max_retries}): {e}")
             db.rollback()
+            
             if attempt == max_retries - 1:
-                raise
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to generate unique invoice number after {max_retries} attempts"
+                )
+            
             time.sleep(0.1 * (attempt + 1))
     
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Failed to generate unique invoice number after {max_retries} attempts"
+        detail="Failed to generate invoice number"
     )
-
-
 
 def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Customer) -> BytesIO:
     """
