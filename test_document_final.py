@@ -19,6 +19,17 @@ from pathlib import Path
 import sys
 import os
 import random
+"""
+Document Processing End-to-End Test
+Tests the complete flow: Upload → OCR → Groq → Database
+"""
+import requests
+import time
+import random
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont  # ADD THIS LINE
+
+# Rest of your code...
 
 # ============================================================================
 # CONFIGURATION
@@ -68,104 +79,120 @@ def print_json(data, title=None):
 # ============================================================================
 
 def create_sample_receipt():
-    """Create a sample receipt image"""
-    print_section("Creating Sample Receipt Image", C.CYAN)
+    """Create a more realistic receipt image for testing"""
+    print("="*80)
+    print("Creating Sample Receipt Image")
+    print("="*80)
     
+    # Create a larger, clearer image
+    width, height = 800, 1000
+    img = Image.new('RGB', (width, height), color='white')
+    draw = ImageDraw.Draw(img)
+    
+    # Use a larger, clearer font
     try:
-        from PIL import Image, ImageDraw, ImageFont
-        
-        width, height = 600, 800
-        img = Image.new('RGB', (width, height), color='white')
-        draw = ImageDraw.Draw(img)
-        
-        try:
-            font_large = ImageFont.truetype("arial.ttf", 24)
-            font_medium = ImageFont.truetype("arial.ttf", 18)
-            font_small = ImageFont.truetype("arial.ttf", 14)
-        except:
-            try:
-                font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-                font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-                font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-            except:
-                font_large = ImageFont.load_default()
-                font_medium = ImageFont.load_default()
-                font_small = ImageFont.load_default()
-        
-        y = 40
-        draw.text((150, y), "ABC SUPERMARKET", fill='black', font=font_large)
+        # Try to use a system font
+        title_font = ImageFont.truetype("arial.ttf", 40)
+        header_font = ImageFont.truetype("arial.ttf", 28)
+        item_font = ImageFont.truetype("arial.ttf", 24)
+        total_font = ImageFont.truetype("arialbd.ttf", 32)  # Bold for totals
+    except:
+        # Fallback to default
+        title_font = ImageFont.load_default()
+        header_font = ImageFont.load_default()
+        item_font = ImageFont.load_default()
+        total_font = ImageFont.load_default()
+    
+    y = 50
+    
+    # Store name (centered, bold)
+    store_name = "ABC SUPERMARKET"
+    draw.text((width//2, y), store_name, fill='black', font=title_font, anchor='mm')
+    y += 60
+    
+    # Store details
+    draw.text((width//2, y), "123 Lagos Street, Victoria Island", fill='black', font=header_font, anchor='mm')
+    y += 40
+    draw.text((width//2, y), "Tel: +234-801-234-5678", fill='black', font=header_font, anchor='mm')
+    y += 40
+    draw.text((width//2, y), "TIN: 12345678-0001", fill='black', font=header_font, anchor='mm')
+    y += 60
+    
+    # Separator line
+    draw.line([(50, y), (width-50, y)], fill='black', width=2)
+    y += 40
+    
+    # Receipt number and date
+    draw.text((50, y), "RECEIPT NO: RCT-2024-001", fill='black', font=header_font)
+    y += 35
+    draw.text((50, y), "DATE: 17/02/2024", fill='black', font=header_font)
+    y += 60
+    
+    # Items header
+    draw.line([(50, y), (width-50, y)], fill='black', width=2)
+    y += 40
+    draw.text((50, y), "ITEM", fill='black', font=item_font)
+    draw.text((400, y), "QTY", fill='black', font=item_font)
+    draw.text((width-200, y), "PRICE", fill='black', font=item_font, anchor='rm')
+    y += 40
+    draw.line([(50, y), (width-50, y)], fill='black', width=1)
+    y += 40
+    
+    # Items
+    items = [
+        ("Rice (50kg)", "2", "12,000.00"),
+        ("Cooking Oil (5L)", "3", "4,500.00"),
+        ("Sugar (2kg)", "5", "2,500.00"),
+    ]
+    
+    subtotal = 0
+    for item, qty, price in items:
+        draw.text((50, y), item, fill='black', font=item_font)
+        draw.text((420, y), qty, fill='black', font=item_font)
+        draw.text((width-50, y), f"₦{price}", fill='black', font=item_font, anchor='rm')
         y += 40
-        draw.text((120, y), "123 Lagos Street, Victoria Island", fill='black', font=font_small)
-        y += 25
-        draw.text((200, y), "Tel: 080-1234-5678", fill='black', font=font_small)
-        y += 25
-        draw.text((220, y), "TIN: 12345678-0001", fill='black', font=font_small)
-        y += 40
-        draw.line([(50, y), (550, y)], fill='black', width=2)
-        y += 30
-        draw.text((50, y), f"Date: {datetime.now().strftime('%d/%m/%Y')}", fill='black', font=font_small)
-        draw.text((350, y), "Receipt: R-001234", fill='black', font=font_small)
-        y += 30
-        draw.text((50, y), "Cashier: John Doe", fill='black', font=font_small)
-        y += 40
-        draw.text((50, y), "ITEMS:", fill='black', font=font_medium)
-        y += 35
-        
-        items = [
-            ("Rice (5kg)", "2", "3,500", "7,000"),
-            ("Cooking Oil", "1", "2,500", "2,500"),
-            ("Sugar (2kg)", "1", "1,500", "1,500"),
-            ("Tomato Paste", "3", "800", "2,400"),
-        ]
-        
-        for item, qty, price, total in items:
-            draw.text((50, y), item, fill='black', font=font_small)
-            draw.text((280, y), qty, fill='black', font=font_small)
-            draw.text((340, y), f"x {price}", fill='black', font=font_small)
-            draw.text((460, y), f"= {total}", fill='black', font=font_small)
-            y += 25
-        
-        y += 20
-        draw.line([(50, y), (550, y)], fill='black', width=1)
-        y += 25
-        draw.text((300, y), "Subtotal:", fill='black', font=font_small)
-        draw.text((460, y), "13,400", fill='black', font=font_small)
-        y += 25
-        draw.text((300, y), "VAT (7.5%):", fill='black', font=font_small)
-        draw.text((460, y), "1,005", fill='black', font=font_small)
-        y += 30
-        draw.line([(300, y), (550, y)], fill='black', width=2)
-        y += 25
-        draw.text((300, y), "TOTAL:", fill='black', font=font_large)
-        draw.text((460, y), "NGN 14,405", fill='black', font=font_large)
-        y += 50
-        draw.line([(50, y), (550, y)], fill='black', width=2)
-        y += 30
-        draw.text((50, y), "Payment Method: Cash", fill='black', font=font_small)
-        y += 25
-        draw.text((50, y), "Amount Paid: NGN 15,000", fill='black', font=font_small)
-        y += 25
-        draw.text((50, y), "Change: NGN 595", fill='black', font=font_small)
-        y += 40
-        draw.line([(50, y), (550, y)], fill='black', width=2)
-        y += 30
-        draw.text((150, y), "THANK YOU FOR YOUR PATRONAGE", fill='black', font=font_medium)
-        
-        receipt_path = Path("test_receipt.jpg")
-        img.save(receipt_path, 'JPEG', quality=95)
-        
-        print_success(f"Created: {receipt_path}")
-        print_info("Receipt: ABC Supermarket, Total: ₦14,405")
-        
-        return str(receipt_path)
-        
-    except ImportError:
-        print_error("PIL not installed. Run: pip install pillow")
-        return None
-    except Exception as e:
-        print_error(f"Error: {e}")
-        return None
-
+        # Calculate subtotal
+        subtotal += float(price.replace(',', ''))
+    
+    y += 20
+    draw.line([(50, y), (width-50, y)], fill='black', width=1)
+    y += 40
+    
+    # Totals
+    vat = subtotal * 0.075
+    total = subtotal + vat
+    
+    draw.text((50, y), "SUBTOTAL:", fill='black', font=item_font)
+    draw.text((width-50, y), f"₦{subtotal:,.2f}", fill='black', font=item_font, anchor='rm')
+    y += 40
+    
+    draw.text((50, y), "VAT (7.5%):", fill='black', font=item_font)
+    draw.text((width-50, y), f"₦{vat:,.2f}", fill='black', font=item_font, anchor='rm')
+    y += 50
+    
+    draw.line([(50, y), (width-50, y)], fill='black', width=2)
+    y += 40
+    
+    draw.text((50, y), "TOTAL:", fill='black', font=total_font)
+    draw.text((width-50, y), f"₦{total:,.2f}", fill='black', font=total_font, anchor='rm')
+    y += 60
+    
+    draw.line([(50, y), (width-50, y)], fill='black', width=2)
+    y += 40
+    
+    # Payment info
+    draw.text((50, y), "Payment Method: CASH", fill='black', font=item_font)
+    y += 40
+    draw.text((width//2, y), "Thank you for your patronage!", fill='black', font=header_font, anchor='mm')
+    
+    # Save
+    filename = 'test_receipt.jpg'
+    img.save(filename, quality=95, optimize=True)
+    
+    print(f"✓ Created: {filename}")
+    print(f"ℹ Receipt: ABC SUPERMARKET, Total: ₦{total:,.2f}")
+    
+    return filename, total
 # ============================================================================
 # AUTHENTICATION
 # ============================================================================
@@ -445,7 +472,7 @@ def main():
         sys.exit(1)
     
     # Create receipt
-    receipt_path = create_sample_receipt()
+    receipt_path, expected_total = create_sample_receipt()
     if not receipt_path:
         sys.exit(1)
     

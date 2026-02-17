@@ -3,6 +3,8 @@ Image Preprocessing for OCR
 Location: app/services/ocr/preprocessor.py
 
 Enhances image quality before text extraction for better OCR results
+
+FIXED: Prevents 90-degree rotations that destroy text readability
 """
 import cv2
 import numpy as np
@@ -22,7 +24,7 @@ class ImagePreprocessor:
     - Grayscale conversion
     - Noise reduction (denoising)
     - Contrast enhancement (CLAHE)
-    - Deskewing (straighten rotated images)
+    - Deskewing (straighten rotated images) - FIXED
     - Binarization (adaptive thresholding)
     - Border removal
     """
@@ -84,7 +86,7 @@ class ImagePreprocessor:
             if self.debug_mode and output_dir:
                 self._save_debug(binary, output_dir, "04_binary.jpg")
             
-            # Step 5: Deskew (straighten image)
+            # Step 5: Deskew (straighten image) - FIXED
             deskewed = self._deskew(binary)
             if self.debug_mode and output_dir:
                 self._save_debug(deskewed, output_dir, "05_deskewed.jpg")
@@ -119,7 +121,7 @@ class ImagePreprocessor:
         """
         Straighten skewed/rotated image
         
-        Uses minimum area rectangle to detect rotation angle
+        FIXED: Prevents 90-degree rotations that destroy OCR accuracy
         
         Args:
             image: Input binary image
@@ -143,6 +145,13 @@ class ImagePreprocessor:
                 angle = -(90 + angle)
             else:
                 angle = -angle
+            
+            # ================================================================
+            # CRITICAL FIX: Prevent large rotations (90° rotations are wrong)
+            # ================================================================
+            if abs(angle) > 45:
+                logger.info(f"Skipping large rotation ({angle:.2f}°) - likely incorrect detection")
+                return image
             
             # Only deskew if angle is significant (> 0.5 degrees)
             if abs(angle) < 0.5:

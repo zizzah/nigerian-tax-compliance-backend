@@ -1,17 +1,23 @@
 """
-Document Processing API Endpoints - QStash Version
+Document Processing API Endpoints - FIXED VERSION
 Location: app/api/v1/endpoints/documents.py
 
-UPDATED: Uses QStash instead of Celery for background processing
+CHANGES:
+- Synchronous processing in development mode (no QStash needed)
+- Async QStash processing in production
+- Better error handling
+- FIXED: JSON serialization for dates and decimals
 """
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query # type: ignore
-from fastapi.responses import FileResponse # type: ignore
-from sqlalchemy.orm import Session # type: ignore
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
 from typing import Optional, List
 import uuid
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import logging
+import time
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,10 @@ from app.services.qstash_client import qstash
 router = APIRouter(prefix="/documents", tags=["Documents - AI Processing"])
 
 
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
 def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
     """Get user's business or raise 404"""
     business = db.query(Business).filter(Business.user_id == user_id).first()
@@ -43,6 +53,194 @@ def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
         )
     return business
 
+
+def convert_decimals(obj):
+    """
+    Recursively convert Decimal and date objects for JSON serialization
+    
+    FIXED: Now handles date objects properly
+    """
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimals(item) for item in obj]
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, (date, datetime)):
+        return obj.isoformat()  # Convert dates to ISO string
+    return obj
+
+
+def process_document_sync(document: Document, db: Session) -> dict:
+    """
+    Process document synchronously (for development mode)
+    
+    FIXED: Properly handles date conversion and JSON serialization
+    
+    Args:
+        document: Document object to process
+        db: Database session
+        
+    Returns:
+        Processing result dictionary
+    """
+    from app.services.ocr.preprocessor import ImagePreprocessor
+    from app.services.ocr.extractor import OCRExtractor
+    from app.services.ai.groq_extractor import GroqReceiptExtractor
+    
+    try:
+        logger.info(f"Starting synchronous processing for document: {document.id}")
+        
+        # Update status
+        document.status = ProcessingStatus.PROCESSING
+        document.processing_started_at = datetime.now(timezone.utc)
+        db.commit()
+        
+        start_time = time.time()
+        
+        # Step 1: Preprocess image
+        logger.info("Step 1: Preprocessing image...")
+        preprocessor = ImagePreprocessor()
+        
+        file_path = Path(document.file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {document.file_path}")
+        
+        preprocessed_image = preprocessor.preprocess(str(file_path))
+        
+        # Step 2: Run OCR
+        logger.info("Step 2: Running OCR...")
+        ocr = OCRExtractor()
+        ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
+        
+        document.ocr_raw_text = ocr_text
+        document.ocr_confidence = ocr_confidence
+        db.commit()
+        
+        logger.info(f"OCR confidence: {ocr_confidence:.2%}")
+        
+        if not ocr_text or len(ocr_text.strip()) < 10:
+            raise ValueError("OCR extracted no meaningful text from image")
+        
+        # Step 3: AI extraction with Groq
+        logger.info("Step 3: AI extraction with Groq...")
+        groq = GroqReceiptExtractor()
+        extracted_data = groq.extract_receipt_data(ocr_text=ocr_text)
+        
+        # Step 4: Save extracted data
+        logger.info("Step 4: Saving extracted data...")
+        
+        # Vendor information
+        document.vendor_name = extracted_data.get('vendor_name')
+        document.vendor_tin = extracted_data.get('vendor_tin')
+        document.vendor_address = extracted_data.get('vendor_address')
+        document.vendor_phone = extracted_data.get('vendor_phone')
+        
+        # Document information
+        document.document_number = extracted_data.get('document_number')
+        
+        # ====================================================================
+        # FIXED: Handle date conversion properly
+        # ====================================================================
+        doc_date = extracted_data.get('document_date')
+        if doc_date:
+            # If it's already a date object, use it
+            if isinstance(doc_date, date):
+                document.document_date = doc_date
+            # If it's a string, parse it
+            elif isinstance(doc_date, str):
+                try:
+                    document.document_date = datetime.strptime(doc_date, '%Y-%m-%d').date()
+                except Exception as e:
+                    logger.warning(f"Failed to parse date '{doc_date}': {e}")
+                    document.document_date = None
+            else:
+                document.document_date = None
+        else:
+            document.document_date = None
+        
+        # Line items - convert decimals for JSON storage
+        line_items_raw = extracted_data.get('line_items', [])
+        document.line_items = convert_decimals(line_items_raw)
+        
+        # Financial data
+        document.subtotal = extracted_data.get('subtotal', 0)
+        document.vat_amount = extracted_data.get('vat_amount', 0)
+        document.total_amount = extracted_data.get('total_amount', 0)
+        document.vat_rate = extracted_data.get('vat_rate', 7.5)
+        
+        # Payment information
+        document.payment_method = extracted_data.get('payment_method')
+        document.payment_reference = extracted_data.get('payment_reference')
+        
+        # Auto-categorize
+        if not extracted_data.get('category') and document.vendor_name:
+            try:
+                line_items = document.line_items or []
+                description = line_items[0].get('description', '') if line_items else ''
+                category = groq.categorize_expense(description, document.vendor_name)
+                document.category = category
+            except Exception as e:
+                logger.warning(f"Auto-categorization failed: {e}")
+                document.category = 'Other'
+        else:
+            document.category = extracted_data.get('category', 'Other')
+        
+        # Confidence and review flags
+        document.confidence_score = extracted_data.get('confidence_score')
+        document.requires_review = extracted_data.get('requires_review', False)
+        
+        # ====================================================================
+        # FIXED: Convert dates and decimals before saving to JSONB
+        # ====================================================================
+        document.ai_extracted_data = convert_decimals(extracted_data)
+        document.ai_model_used = "llama-3.3-70b-versatile"
+        
+        # Mark as completed
+        document.status = ProcessingStatus.COMPLETED
+        document.processing_completed_at = datetime.now(timezone.utc)
+        
+        processing_duration = time.time() - start_time
+        document.processing_duration_seconds = processing_duration
+        
+        db.commit()
+        
+        logger.info(f"✅ Successfully processed: {document.original_filename}")
+        logger.info(f"   Vendor: {document.vendor_name}")
+        logger.info(f"   Total: ₦{float(document.total_amount):,.2f}")
+        logger.info(f"   Processing time: {processing_duration:.2f}s")
+        
+        return {
+            "status": "processed",
+            "document_id": str(document.id),
+            "vendor_name": document.vendor_name,
+            "total_amount": float(document.total_amount),
+            "confidence_score": float(document.confidence_score) if document.confidence_score else None,
+            "processing_time": processing_duration
+        }
+    
+    except Exception as e:
+        logger.error(f"Synchronous processing failed: {e}", exc_info=True)
+        
+        # Mark as failed
+        document.status = ProcessingStatus.FAILED
+        document.processing_error = str(e)[:500]
+        document.processing_completed_at = datetime.now(timezone.utc)
+        
+        if document.processing_started_at:
+            duration = (
+                datetime.now(timezone.utc) - document.processing_started_at
+            ).total_seconds()
+            document.processing_duration_seconds = duration
+        
+        db.commit()
+        
+        raise
+
+
+# ============================================================================
+# Document Upload Endpoint - FIXED VERSION
+# ============================================================================
 
 @router.post("/upload", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
@@ -55,7 +253,10 @@ async def upload_document(
     """
     Upload receipt/document for AI processing with Groq
     
-    **UPDATED: Uses QStash for serverless background processing**
+    **FIXED VERSION:**
+    - Development: Synchronous processing (no QStash needed)
+    - Production: Async QStash processing
+    - Proper JSON serialization for dates and decimals
     
     **File types:** PNG, JPG, PDF (max 10MB)
     **Processing:** ~10-15 seconds with Groq AI
@@ -146,52 +347,99 @@ async def upload_document(
             detail="Failed to create document record"
         )
     
-    # ====================================================================
-    # QUEUE FOR AI PROCESSING WITH QSTASH (REPLACES CELERY)
-    # ====================================================================
+    # ========================================================================
+    # PROCESSING: Synchronous (Dev) or Async (Production)
+    # ========================================================================
     
     try:
-        # Get your Render service URL from environment variable
-        base_url = getattr(settings, 'RENDER_EXTERNAL_URL', "https://your-app.onrender.com")
+        # Check environment
+        is_development = settings.ENVIRONMENT.lower() == "development"
         
-        callback_url = f"{base_url}/api/v1/background/process-document"
+        if is_development:
+            # ================================================================
+            # DEVELOPMENT MODE: Process synchronously
+            # ================================================================
+            logger.info("🔧 Development mode: Processing synchronously...")
+            
+            try:
+                result = process_document_sync(document, db)
+                
+                return {
+                    "document_id": document.id,
+                    "status": document.status,
+                    "message": f"Document processed successfully (sync mode)",
+                    "estimated_completion_seconds": 0,  # Already done
+                    "processing_result": result
+                }
+                
+            except Exception as e:
+                # Document already marked as failed in process_document_sync
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Document processing failed: {str(e)}"
+                )
         
-        # Publish task to QStash
-        response = qstash.publish(
-            url=callback_url,
-            body={
-                "document_id": str(document.id),
-                "business_id": str(business.id)
-            },
-            delay=0,  # Process immediately (or set delay in seconds)
-            retries=3  # Retry up to 3 times on failure
-        )
-        
-        task_id = response.get("messageId", "unknown")
-        
-        logger.info(f"Document queued for processing: {document.id}, QStash Message: {task_id}")
-        
+        else:
+            # ================================================================
+            # PRODUCTION MODE: Queue with QStash
+            # ================================================================
+            logger.info("🚀 Production mode: Queuing for async processing...")
+            
+            # Get production URL
+            base_url = getattr(settings, 'RENDER_EXTERNAL_URL', None)
+            
+            if not base_url:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="RENDER_EXTERNAL_URL not configured. Set it in your environment variables."
+                )
+            
+            callback_url = f"{base_url}/api/v1/background/process-document"
+            
+            # Publish task to QStash
+            response = qstash.publish(
+                url=callback_url,
+                body={
+                    "document_id": str(document.id),
+                    "business_id": str(business.id)
+                },
+                delay=0,  # Process immediately
+                retries=3  # Retry up to 3 times on failure
+            )
+            
+            task_id = response.get("messageId", "unknown")
+            
+            logger.info(f"Document queued for processing: {document.id}, QStash Message: {task_id}")
+            
+            return {
+                "document_id": document.id,
+                "task_id": task_id,
+                "status": document.status,
+                "message": "Document uploaded. AI processing started.",
+                "estimated_completion_seconds": 15
+            }
+    
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    
     except Exception as e:
-        logger.error(f"Failed to queue document for processing: {e}")
+        logger.error(f"Failed to queue/process document: {e}", exc_info=True)
         
-        # Mark as failed so user knows
+        # Mark as failed
         document.status = ProcessingStatus.FAILED
-        document.processing_error = "Failed to queue for processing"
+        document.processing_error = f"Failed to queue for processing: {str(e)}"
         db.commit()
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Document uploaded but failed to queue for processing"
+            detail=f"Document uploaded but processing failed: {str(e)}"
         )
-    
-    return {
-        "document_id": document.id,
-        "task_id": task_id,
-        "status": document.status,
-        "message": "Document uploaded. AI processing started.",
-        "estimated_completion_seconds": 15
-    }
 
+
+# ============================================================================
+# Document Retrieval Endpoints (NO CHANGES)
+# ============================================================================
 
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
@@ -237,7 +485,7 @@ async def list_documents(
         query = query.filter(Document.status == status)
     
     total = query.count()
-    documents = query.order_by(Document.uploaded_at.desc()).offset(skip).limit(limit).all()
+    documents = query.order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
     
     return {
         "documents": documents,
@@ -389,7 +637,13 @@ async def reprocess_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Reprocess a failed or completed document"""
+    """
+    Reprocess a failed or completed document
+    
+    Respects development/production mode:
+    - Development: Reprocesses synchronously
+    - Production: Requeues with QStash
+    """
     business = get_user_business(db, current_user.id)
     
     document = db.query(Document).filter(
@@ -406,44 +660,76 @@ async def reprocess_document(
     # Reset document status
     document.status = ProcessingStatus.PENDING
     document.processing_error = None
-    document.processed_at = None
+    document.processing_completed_at = None
+    document.processing_started_at = None
+    document.processing_duration_seconds = None
     db.commit()
     
-    # Queue for processing with QStash
     try:
-        base_url = getattr(settings, 'RENDER_EXTERNAL_URL', "https://your-app.onrender.com")
-        callback_url = f"{base_url}/api/v1/background/process-document"
+        # Check environment
+        is_development = settings.ENVIRONMENT.lower() == "development"
         
-        response = qstash.publish(
-            url=callback_url,
-            body={
-                "document_id": str(document.id),
-                "business_id": str(business.id)
-            },
-            delay=0,
-            retries=3
-        )
+        if is_development:
+            # Development: Process synchronously
+            logger.info("🔧 Reprocessing synchronously (development mode)...")
+            
+            result = process_document_sync(document, db)
+            
+            return {
+                "document_id": document.id,
+                "status": document.status,
+                "message": "Document reprocessed successfully (sync mode)",
+                "estimated_completion_seconds": 0,
+                "processing_result": result
+            }
         
-        task_id = response.get("messageId", "unknown")
-        
-        logger.info(f"Document requeued for processing: {document.id}, QStash Message: {task_id}")
-        
+        else:
+            # Production: Queue with QStash
+            logger.info("🚀 Requeuing for async processing (production mode)...")
+            
+            base_url = getattr(settings, 'RENDER_EXTERNAL_URL', None)
+            
+            if not base_url:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="RENDER_EXTERNAL_URL not configured"
+                )
+            
+            callback_url = f"{base_url}/api/v1/background/process-document"
+            
+            response = qstash.publish(
+                url=callback_url,
+                body={
+                    "document_id": str(document.id),
+                    "business_id": str(business.id)
+                },
+                delay=0,
+                retries=3
+            )
+            
+            task_id = response.get("messageId", "unknown")
+            
+            logger.info(f"Document requeued: {document.id}, QStash Message: {task_id}")
+            
+            return {
+                "document_id": document.id,
+                "task_id": task_id,
+                "status": document.status,
+                "message": "Document requeued for AI processing.",
+                "estimated_completion_seconds": 15
+            }
+    
+    except HTTPException:
+        raise
+    
     except Exception as e:
-        logger.error(f"Failed to requeue document: {e}")
+        logger.error(f"Failed to reprocess document: {e}", exc_info=True)
         
         document.status = ProcessingStatus.FAILED
-        document.processing_error = "Failed to queue for reprocessing"
+        document.processing_error = f"Reprocessing failed: {str(e)}"
         db.commit()
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to queue document for reprocessing"
+            detail=f"Failed to reprocess document: {str(e)}"
         )
-    
-    return {
-        "document_id": document.id,
-        "task_id": task_id,
-        "status": document.status,
-        "message": "Document requeued for AI processing.",
-        "estimated_completion_seconds": 15
-    }
