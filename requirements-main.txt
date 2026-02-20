@@ -29,7 +29,6 @@ python-dotenv==1.0.1
 # ===============================
 # BACKGROUND TASKS - QSTASH (REPLACES CELERY)
 # ===============================
-# NOTE: The correct package name is 'qstash' not 'upstash-qstash'
 qstash==2.0.2
 
 # ===============================
@@ -39,7 +38,7 @@ groq==0.11.0
 pytesseract==0.3.13
 Pillow==10.3.0
 opencv-python-headless==4.10.0.84
-numpy==2.4.1
+numpy==1.26.4
 
 # ===============================
 # PDF GENERATION
@@ -73,8 +72,8 @@ cachetools==5.3.2
 # ===============================
 # SECURITY & MONITORING
 # ===============================
-slowapi==0.1.9  # Rate limiting for FastAPI
-bleach==6.2.0  # Input sanitization and XSS prevention
-sentry-sdk==2.19.2  # Error tracking and monitoring
-bandit==1.8.0  # Security linting tool
-pip-audit==2.9.0  # Dependency vulnerability scanner (replaces safety)
+slowapi==0.1.9
+bleach==6.2.0
+sentry-sdk==2.19.2
+bandit==1.8.0
+pip-audit==2.9.0
