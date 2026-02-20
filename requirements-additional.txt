@@ -1,5 +1,4 @@
 # OCR & Image Processing
-opencv-python==4.9.0.80
 pdf2image==1.17.0
 pypdf2==3.0.1
 pdfplumber==0.10.3
@@ -7,14 +6,6 @@ pdfplumber==0.10.3
 # PDF Generation
 reportlab==4.0.9
 weasyprint==60.2
-
-# Vector Database & Embeddings
-chromadb==0.4.22
-sentence-transformers==2.3.1
-
-# NLP
-transformers==4.37.2
-torch==2.2.0
 
 # Email
 fastapi-mail==1.4.1
