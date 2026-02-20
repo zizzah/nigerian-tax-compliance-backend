@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     poppler-utils \
     tesseract-ocr \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (better caching)
@@ -33,3 +35,12 @@ EXPOSE 8000
 
 # FIXED: Correct module path
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]
+```
+
+**Two lines added:**
+- `libgl1` — provides `libGL.so.1` that OpenCV requires at runtime
+- `libglib2.0-0` — provides `libglib` that OpenCV also links against (you'd hit this next without it)
+
+**Also fix your `requirements-additional.txt`** — remove this line since it conflicts with the headless version in `requirements-main.txt`:
+```
+opencv-python==4.9.0.80   # DELETE THIS LINE
