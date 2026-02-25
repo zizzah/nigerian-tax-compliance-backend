@@ -183,7 +183,7 @@ app = FastAPI(
 app.state.limiter = limiter
 
 # SECURITY: Add rate limit exception handler
-app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler) # type: ignore
 
 # ============================================================================
 # FIX: Add SlowAPI Middleware (CRITICAL for rate limiting)
@@ -252,10 +252,10 @@ app.include_router(background.router, prefix=settings.API_V1_PREFIX)
 # Exception Handlers
 # ============================================================================
 
-app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(BaseAPIException, custom_exception_handler)
-app.add_exception_handler(DBAPIError, database_exception_handler)
+app.add_exception_handler(StarletteHTTPException, http_exception_handler) # type: ignore
+app.add_exception_handler(RequestValidationError, validation_exception_handler) # type: ignore
+app.add_exception_handler(BaseAPIException, custom_exception_handler)  # type: ignore
+app.add_exception_handler(DBAPIError, database_exception_handler) # type: ignore
 app.add_exception_handler(Exception, general_exception_handler)
 
 # ============================================================================
