@@ -1,4 +1,14 @@
 import pytest
+import os
+
+# Set required environment variables before importing app modules
+os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-for-testing-only")
+os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
+os.environ.setdefault("QSTASH_TOKEN", "test-qstash-token")
+os.environ.setdefault("QSTASH_CURRENT_SIGNING_KEY", "test-signing-key")
+os.environ.setdefault("QSTASH_NEXT_SIGNING_KEY", "test-next-signing-key")
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient

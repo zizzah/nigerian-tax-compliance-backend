@@ -73,16 +73,27 @@ class Settings(BaseSettings):
     # ====================================================================
     # CORS SETTINGS - SECURITY ENHANCED
     # ====================================================================
+    # Allow overriding CORS origins via environment variable (comma-separated)
+    BACKEND_CORS_ORIGINS: Optional[str] = None
+    
     @property
-    def BACKEND_CORS_ORIGINS(self) -> List[str]:
+    def BACKEND_CORS_ORIGINS_LIST(self) -> List[str]:
         """
-        Get CORS origins based on environment.
+        Get CORS origins based on environment or BACKEND_CORS_ORIGINS env var.
         
         SECURITY: Strict origin control based on environment
         - Production: Only allow specific production domains
         - Staging: Only allow staging domain
         - Development: Only allow localhost
+        
+        Override with BACKEND_CORS_ORIGINS environment variable (comma-separated).
         """
+        # First check if explicitly set via environment variable
+        if self.BACKEND_CORS_ORIGINS:
+            origins = [origin.strip() for origin in self.BACKEND_CORS_ORIGINS.split(",")]
+            return origins
+        
+        # Otherwise, use environment-based defaults
         if self.ENVIRONMENT == "production":
             # IMPORTANT: Replace these with your actual production domains
             return [

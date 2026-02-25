@@ -211,7 +211,7 @@ app.add_middleware(
 # SECURITY 4: CORS Middleware - STRICT CONFIGURATION
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,  # Strict origins from config
+    allow_origins=settings.BACKEND_CORS_ORIGINS_LIST,  # Strict origins from config
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=[
