@@ -1,4 +1,4 @@
-import pytest
+import pytest # type: ignore
 import os
 
 # Set required environment variables before importing app modules
@@ -9,10 +9,10 @@ os.environ.setdefault("QSTASH_TOKEN", "test-qstash-token")
 os.environ.setdefault("QSTASH_CURRENT_SIGNING_KEY", "test-signing-key")
 os.environ.setdefault("QSTASH_NEXT_SIGNING_KEY", "test-next-signing-key")
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from fastapi.testclient import TestClient
-from app.core.database import Base, get_db
+from sqlalchemy import create_engine # type: ignore
+from sqlalchemy.orm import sessionmaker # type: ignore
+from fastapi.testclient import TestClient # type: ignore
+from app.core.database import Base, get_db # type: ignore
 from app.main import app
 from app.core.config import settings
 

@@ -148,6 +148,8 @@ app = FastAPI(
     debug=settings.DEBUG,
     docs_url="/docs",
     redoc_url="/redoc",
+    redirect_slashes=False,   # <-- ADD THIS LINE
+
     description="""
     🇳🇬 Nigerian Tax Compliance Platform API
     

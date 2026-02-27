@@ -7,7 +7,7 @@ Tests for core security functions including:
 - Token generation/validation
 - Authentication helpers
 """
-import pytest
+import pytest # type: ignore
 import os
 import sys
 
