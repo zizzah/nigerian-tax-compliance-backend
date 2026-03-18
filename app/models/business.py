@@ -82,6 +82,7 @@ class Business(Base):
     products = relationship("Product", back_populates="business", cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="business", cascade="all, delete-orphan")
     payment_links = relationship("PaymentLink", back_populates="business", cascade="all, delete-orphan")
+    expenses = relationship("Expense", back_populates="business", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Business {self.business_name}>"

@@ -12,7 +12,8 @@ from app.models.product import Product
 from app.models.invoice import Invoice
 from app.models.invoice_item import InvoiceItem
 from app.models.payment import Payment
-from app.models.document import Document    
+from app.models.document import Document  
+from app.models.expense import Expense  
 
 __all__ = [
     "Base",
@@ -23,6 +24,7 @@ __all__ = [
     "Invoice",
     "InvoiceItem",
     "Payment",
+    "Expense",
     "Document"
 
 ]
