@@ -92,8 +92,9 @@ def process_document_sync(document: Document, db: Session) -> dict:
         logger.info(f"Starting synchronous processing for document: {document.id}")
         
         # Update status
-        document.status = ProcessingStatus.PROCESSING
-        document.processing_started_at = datetime.now(timezone.utc)
+        document.status = ProcessingStatus.PROCESSING  # type: ignore
+        document.processing_started_at = datetime.now(timezone.utc) # type: ignore
+
         db.commit()
         
         start_time = time.time()
@@ -102,7 +103,7 @@ def process_document_sync(document: Document, db: Session) -> dict:
         logger.info("Step 1: Preprocessing image...")
         preprocessor = ImagePreprocessor()
         
-        file_path = Path(document.file_path)
+        file_path = Path(document.file_path) # type: ignore
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {document.file_path}")
         
@@ -113,8 +114,8 @@ def process_document_sync(document: Document, db: Session) -> dict:
         ocr = OCRExtractor()
         ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
         
-        document.ocr_raw_text = ocr_text
-        document.ocr_confidence = ocr_confidence
+        document.ocr_raw_text = ocr_text # type: ignore
+        document.ocr_confidence = ocr_confidence  # type: ignore
         db.commit()
         
         logger.info(f"OCR confidence: {ocr_confidence:.2%}")
@@ -131,13 +132,13 @@ def process_document_sync(document: Document, db: Session) -> dict:
         logger.info("Step 4: Saving extracted data...")
         
         # Vendor information
-        document.vendor_name = extracted_data.get('vendor_name')
-        document.vendor_tin = extracted_data.get('vendor_tin')
-        document.vendor_address = extracted_data.get('vendor_address')
-        document.vendor_phone = extracted_data.get('vendor_phone')
+        document.vendor_name = extracted_data.get('vendor_name') # type: ignore
+        document.vendor_tin = extracted_data.get('vendor_tin') # type: ignore
+        document.vendor_address = extracted_data.get('vendor_address') # type: ignore
+        document.vendor_phone = extracted_data.get('vendor_phone') # type: ignore
         
         # Document information
-        document.document_number = extracted_data.get('document_number')
+        document.document_number = extracted_data.get('document_number') # type: ignore
         
         # ====================================================================
         # FIXED: Handle date conversion properly
@@ -146,62 +147,62 @@ def process_document_sync(document: Document, db: Session) -> dict:
         if doc_date:
             # If it's already a date object, use it
             if isinstance(doc_date, date):
-                document.document_date = doc_date
+                document.document_date = doc_date # type: ignore
             # If it's a string, parse it
             elif isinstance(doc_date, str):
                 try:
-                    document.document_date = datetime.strptime(doc_date, '%Y-%m-%d').date()
+                    document.document_date = datetime.strptime(doc_date, '%Y-%m-%d').date() # type: ignore
                 except Exception as e:
                     logger.warning(f"Failed to parse date '{doc_date}': {e}")
-                    document.document_date = None
+                    document.document_date = None # type: ignore
             else:
-                document.document_date = None
+                document.document_date = None # type: ignore
         else:
-            document.document_date = None
+            document.document_date = None # type: ignore
         
         # Line items - convert decimals for JSON storage
         line_items_raw = extracted_data.get('line_items', [])
-        document.line_items = convert_decimals(line_items_raw)
+        document.line_items = convert_decimals(line_items_raw) # type: ignore
         
         # Financial data
-        document.subtotal = extracted_data.get('subtotal', 0)
-        document.vat_amount = extracted_data.get('vat_amount', 0)
-        document.total_amount = extracted_data.get('total_amount', 0)
-        document.vat_rate = extracted_data.get('vat_rate', 7.5)
+        document.subtotal = extracted_data.get('subtotal', 0) # type: ignore
+        document.vat_amount = extracted_data.get('vat_amount', 0) # type: ignore
+        document.total_amount = extracted_data.get('total_amount', 0) # type: ignore
+        document.vat_rate = extracted_data.get('vat_rate', 7.5) # type: ignore
         
         # Payment information
-        document.payment_method = extracted_data.get('payment_method')
-        document.payment_reference = extracted_data.get('payment_reference')
+        document.payment_method = extracted_data.get('payment_method') # type: ignore
+        document.payment_reference = extracted_data.get('payment_reference') # type: ignore
         
         # Auto-categorize
-        if not extracted_data.get('category') and document.vendor_name:
+        if not extracted_data.get('category') and document.vendor_name: # type: ignore
             try:
                 line_items = document.line_items or []
-                description = line_items[0].get('description', '') if line_items else ''
-                category = groq.categorize_expense(description, document.vendor_name)
-                document.category = category
+                description = line_items[0].get('description', '') if line_items else '' # type: ignore
+                category = groq.categorize_expense(description, document.vendor_name) # type: ignore
+                document.category = category # type: ignore
             except Exception as e:
                 logger.warning(f"Auto-categorization failed: {e}")
-                document.category = 'Other'
+                document.category = 'Other'  # type: ignore
         else:
             document.category = extracted_data.get('category', 'Other')
         
         # Confidence and review flags
-        document.confidence_score = extracted_data.get('confidence_score')
+        document.confidence_score = extracted_data.get('confidence_score') # type: ignore
         document.requires_review = extracted_data.get('requires_review', False)
         
         # ====================================================================
         # FIXED: Convert dates and decimals before saving to JSONB
         # ====================================================================
-        document.ai_extracted_data = convert_decimals(extracted_data)
-        document.ai_model_used = "llama-3.3-70b-versatile"
+        document.ai_extracted_data = convert_decimals(extracted_data) # type: ignore
+        document.ai_model_used = "llama-3.3-70b-versatile" # type: ignore
         
         # Mark as completed
-        document.status = ProcessingStatus.COMPLETED
-        document.processing_completed_at = datetime.now(timezone.utc)
+        document.status = ProcessingStatus.COMPLETED  # type: ignore
+        document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
         
         processing_duration = time.time() - start_time
-        document.processing_duration_seconds = processing_duration
+        document.processing_duration_seconds = processing_duration # type: ignore
         
         db.commit()
         
@@ -215,7 +216,7 @@ def process_document_sync(document: Document, db: Session) -> dict:
             "document_id": str(document.id),
             "vendor_name": document.vendor_name,
             "total_amount": float(document.total_amount),
-            "confidence_score": float(document.confidence_score) if document.confidence_score else None,
+            "confidence_score": float(document.confidence_score) if document.confidence_score else None, # type: ignore
             "processing_time": processing_duration
         }
     
@@ -223,11 +224,11 @@ def process_document_sync(document: Document, db: Session) -> dict:
         logger.error(f"Synchronous processing failed: {e}", exc_info=True)
         
         # Mark as failed
-        document.status = ProcessingStatus.FAILED
-        document.processing_error = str(e)[:500]
-        document.processing_completed_at = datetime.now(timezone.utc)
+        document.status = ProcessingStatus.FAILED # type: ignore
+        document.processing_error = str(e)[:500] # type: ignore
+        document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
         
-        if document.processing_started_at:
+        if document.processing_started_at: # type: ignore
             duration = (
                 datetime.now(timezone.utc) - document.processing_started_at
             ).total_seconds()
@@ -261,7 +262,7 @@ async def upload_document(
     **File types:** PNG, JPG, PDF (max 10MB)
     **Processing:** ~10-15 seconds with Groq AI
     """
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     # Validate file type
     allowed_types = ["image/png", "image/jpeg", "image/jpg", "application/pdf"]
@@ -427,8 +428,9 @@ async def upload_document(
         logger.error(f"Failed to queue/process document: {e}", exc_info=True)
         
         # Mark as failed
-        document.status = ProcessingStatus.FAILED
-        document.processing_error = f"Failed to queue for processing: {str(e)}"
+        document.status = ProcessingStatus.FAILED # type: ignore
+        document.processing_error = f"Failed to queue for processing: {str(e)}" # type: ignore
+        document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
         db.commit()
         
         raise HTTPException(
@@ -448,7 +450,7 @@ async def get_document(
     db: Session = Depends(get_db)
 ):
     """Get document details by ID"""
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -474,7 +476,7 @@ async def list_documents(
     db: Session = Depends(get_db)
 ):
     """List all documents with optional filtering"""
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     query = db.query(Document).filter(Document.business_id == business.id)
     
@@ -503,7 +505,7 @@ async def update_document(
     db: Session = Depends(get_db)
 ):
     """Update document metadata (notes, type, etc.)"""
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -534,7 +536,7 @@ async def delete_document(
     db: Session = Depends(get_db)
 ):
     """Delete a document and its file"""
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -549,7 +551,7 @@ async def delete_document(
     
     # Delete physical file
     try:
-        file_path = Path(document.file_path)
+        file_path = Path(document.file_path) # type: ignore
         if file_path.exists():
             file_path.unlink()
             logger.info(f"Deleted file: {file_path}")
@@ -570,7 +572,7 @@ async def download_document(
     db: Session = Depends(get_db)
 ):
     """Download the original document file"""
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -583,7 +585,7 @@ async def download_document(
             detail="Document not found"
         )
     
-    file_path = Path(document.file_path)
+    file_path = Path(document.file_path) # type: ignore
     
     if not file_path.exists():
         raise HTTPException(
@@ -593,8 +595,8 @@ async def download_document(
     
     return FileResponse(
         path=str(file_path),
-        filename=document.original_filename,
-        media_type=document.file_type
+        filename=document.original_filename, # type: ignore
+        media_type=document.file_type # type: ignore
     )
 
 
@@ -604,32 +606,87 @@ async def get_document_statistics(
     db: Session = Depends(get_db)
 ):
     """Get document processing statistics"""
-    business = get_user_business(db, current_user.id)
-    
-    total_documents = db.query(Document).filter(Document.business_id == business.id).count()
-    
-    processed = db.query(Document).filter(
-        Document.business_id == business.id,
-        Document.status == ProcessingStatus.COMPLETED
-    ).count()
-    
-    pending = db.query(Document).filter(
-        Document.business_id == business.id,
-        Document.status == ProcessingStatus.PENDING
-    ).count()
-    
-    failed = db.query(Document).filter(
-        Document.business_id == business.id,
-        Document.status == ProcessingStatus.FAILED
-    ).count()
-    
-    return {
-        "total_documents": total_documents,
-        "processed": processed,
-        "pending": pending,
-        "failed": failed
+    from sqlalchemy import func as sqlfunc
+    from decimal import Decimal as D
+ 
+    business = get_user_business(db, current_user.id) # type: ignore
+    bid = business.id
+ 
+    # Counts by status
+    status_rows = (
+        db.query(Document.status, sqlfunc.count(Document.id))
+        .filter(Document.business_id == bid)
+        .group_by(Document.status)
+        .all()
+    )
+    by_status: dict = {}
+    for s, cnt in status_rows:
+        key = s.value if hasattr(s, "value") else str(s)
+        by_status[key] = cnt
+ 
+    total_documents    = sum(by_status.values())
+    pending_processing = by_status.get("PENDING", 0) + by_status.get("PROCESSING", 0)
+    completed          = by_status.get("COMPLETED", 0)
+    failed             = by_status.get("FAILED", 0)
+ 
+    requires_review = (
+        db.query(sqlfunc.count(Document.id))
+        .filter(Document.business_id == bid, Document.requires_review == True)
+        .scalar() or 0
+    )
+ 
+    total_amount_processed = (
+        db.query(sqlfunc.coalesce(sqlfunc.sum(Document.total_amount), 0))
+        .filter(Document.business_id == bid, Document.status == ProcessingStatus.COMPLETED)
+        .scalar() or D("0")
+    )
+ 
+    avg_confidence = (
+        db.query(sqlfunc.avg(Document.confidence_score))
+        .filter(Document.business_id == bid, Document.confidence_score.isnot(None))
+        .scalar()
+    )
+ 
+    avg_processing_time = (
+        db.query(sqlfunc.avg(Document.processing_duration_seconds))
+        .filter(Document.business_id == bid, Document.processing_duration_seconds.isnot(None))
+        .scalar()
+    )
+ 
+    # Counts by document type
+    type_rows = (
+        db.query(Document.document_type, sqlfunc.count(Document.id))
+        .filter(Document.business_id == bid)
+        .group_by(Document.document_type)
+        .all()
+    )
+    by_type: dict = {
+        (t.value if hasattr(t, "value") else str(t)): cnt
+        for t, cnt in type_rows
     }
-
+ 
+    # Counts by category
+    cat_rows = (
+        db.query(Document.category, sqlfunc.count(Document.id))
+        .filter(Document.business_id == bid, Document.category.isnot(None))
+        .group_by(Document.category)
+        .all()
+    )
+    by_category: dict = {(c or "Unknown"): cnt for c, cnt in cat_rows}
+ 
+    return {
+        "total_documents":        total_documents,
+        "pending_processing":     pending_processing,
+        "completed":              completed,
+        "failed":                 failed,
+        "requires_review":        requires_review,
+        "total_amount_processed": D(str(total_amount_processed)),
+        "average_confidence_score": float(avg_confidence) if avg_confidence else None,
+        "average_processing_time":  float(avg_processing_time) if avg_processing_time else None,
+        "by_type":     by_type,
+        "by_category": by_category,
+        "by_status":   by_status,
+    }
 
 @router.post("/{document_id}/reprocess", response_model=DocumentUploadResponse)
 async def reprocess_document(
@@ -644,7 +701,7 @@ async def reprocess_document(
     - Development: Reprocesses synchronously
     - Production: Requeues with QStash
     """
-    business = get_user_business(db, current_user.id)
+    business = get_user_business(db, current_user.id) # type: ignore
     
     document = db.query(Document).filter(
         Document.id == document_id,
@@ -658,11 +715,12 @@ async def reprocess_document(
         )
     
     # Reset document status
-    document.status = ProcessingStatus.PENDING
-    document.processing_error = None
-    document.processing_completed_at = None
-    document.processing_started_at = None
-    document.processing_duration_seconds = None
+    document.status = ProcessingStatus.PENDING # type: ignore
+    document.processing_error = None # type: ignore
+    document.processing_completed_at = None # type: ignore
+    document.processing_started_at = None # type: ignore
+    document.processing_duration_seconds = None # type: ignore
+
     db.commit()
     
     try:
@@ -725,8 +783,9 @@ async def reprocess_document(
     except Exception as e:
         logger.error(f"Failed to reprocess document: {e}", exc_info=True)
         
-        document.status = ProcessingStatus.FAILED
-        document.processing_error = f"Reprocessing failed: {str(e)}"
+        document.status = ProcessingStatus.FAILED # type: ignore
+        document.processing_error = f"Reprocessing failed: {str(e)}"  # type: ignore
+
         db.commit()
         
         raise HTTPException(

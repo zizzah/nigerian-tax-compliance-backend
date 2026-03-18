@@ -2,29 +2,71 @@
 Models Package
 Location: app/models/__init__.py
 
-Import all models here for Alembic to detect them
+Import ALL models here so Alembic can detect them and relationships resolve.
 """
 from app.core.database import Base
+
+# Core auth & business
 from app.models.user import User
 from app.models.business import Business
 from app.models.customer import Customer
+
+# Products & invoicing
 from app.models.product import Product
 from app.models.invoice import Invoice
 from app.models.invoice_item import InvoiceItem
 from app.models.payment import Payment
-from app.models.document import Document  
-from app.models.expense import Expense  
+
+# Payments / Paystack
+from app.models.payment_link import PaymentLink
+
+# AI document processing
+from app.models.document import Document, DocumentType, ProcessingStatus
+
+# Expense tracking
+from app.models.expense import (
+    Expense,
+    ExpenseCategory,
+    ExpensePaymentMethod,
+    CATEGORY_LABELS,
+    TAX_DEDUCTIBLE,
+    CATEGORY_GROUPS,
+)
+
+# Payment reminders
+from app.models.reminder import ReminderRule, ReminderLog
+
+# Sales targets
+from app.models.sales_target import SalesTarget, split_annual_target
+
 
 __all__ = [
     "Base",
+    # Auth / business
     "User",
     "Business",
     "Customer",
+    # Invoicing
     "Product",
     "Invoice",
     "InvoiceItem",
     "Payment",
+    "PaymentLink",
+    # Documents
+    "Document",
+    "DocumentType",
+    "ProcessingStatus",
+    # Expenses
     "Expense",
-    "Document"
-
+    "ExpenseCategory",
+    "ExpensePaymentMethod",
+    "CATEGORY_LABELS",
+    "TAX_DEDUCTIBLE",
+    "CATEGORY_GROUPS",
+    # Reminders
+    "ReminderRule",
+    "ReminderLog",
+    # Targets
+    "SalesTarget",
+    "split_annual_target",
 ]

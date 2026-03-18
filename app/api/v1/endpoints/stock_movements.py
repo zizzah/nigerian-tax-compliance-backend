@@ -20,7 +20,7 @@ router = APIRouter(prefix="/stock-movements", tags=["stock-movements"])
 
 
 def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.owner_id == user.id).first()
+    biz = db.query(Business).filter(Business.user_id == user.id).first()
     if not biz:
         raise HTTPException(status_code=404, detail="Business not found")
     return biz
