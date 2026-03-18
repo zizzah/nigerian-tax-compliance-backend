@@ -23,7 +23,10 @@ COPY . .
 
 RUN mkdir -p uploads/documents uploads/logos
 
+# Copy and make startup script executable
+COPY start.sh .
+RUN chmod +x start.sh
+
 EXPOSE 8000
 
-# Run migrations then start server
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+CMD ["./start.sh"]
