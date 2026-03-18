@@ -77,6 +77,7 @@ class Invoice(Base):
     customer = relationship("Customer", foreign_keys=[customer_id], lazy="selectin")
     business = relationship("Business", foreign_keys=[business_id], lazy="selectin")
     payments = relationship("Payment", back_populates="invoice", cascade="all, delete-orphan")
+    payment_link = relationship("PaymentLink", back_populates="invoice", uselist=False)
     
     # Properties
     @property

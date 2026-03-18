@@ -3,6 +3,7 @@ Business API Endpoints
 Location: app/api/v1/endpoints/businesses.py
 """
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Optional
 import uuid
@@ -291,4 +292,71 @@ async def get_next_invoice_number(
         "next_invoice_number": business.get_next_invoice_number(),
         "current_counter": business.invoice_counter,
         "prefix": business.invoice_prefix
+    }
+
+# ============================================================================
+# Paystack Keys Endpoint
+# ============================================================================
+
+class PaystackKeysRequest(BaseModel):
+    public_key: str = ""
+    secret_key: str = ""
+
+
+@router.post("/me/paystack", status_code=status.HTTP_200_OK)
+async def save_paystack_keys(
+    data: PaystackKeysRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Save Paystack API keys for this business.
+    Each business on the platform has their own Paystack account and keys.
+    Keys are stored per-business so payments go directly into each business's account.
+    """
+    business = db.query(Business).filter(
+        Business.user_id == current_user.id
+    ).first()
+
+    if not business:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Business profile not found",
+        )
+
+    if data.public_key:
+        setattr(business, "paystack_public_key", data.public_key)
+    if data.secret_key:
+        setattr(business, "paystack_secret_key", data.secret_key)
+
+    db.commit()
+    db.refresh(business)
+
+    return {
+        "message": "Paystack keys saved successfully",
+        "has_public_key": bool(getattr(business, "paystack_public_key", None)),
+        "has_secret_key": bool(getattr(business, "paystack_secret_key", None)),
+    }
+
+
+@router.get("/me/paystack/status", status_code=status.HTTP_200_OK)
+async def get_paystack_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Check whether this business has Paystack keys configured."""
+    business = db.query(Business).filter(
+        Business.user_id == current_user.id
+    ).first()
+
+    if not business:
+        raise HTTPException(status_code=404, detail="Business profile not found")
+
+    return {
+        "has_public_key": bool(getattr(business, "paystack_public_key", None)),
+        "has_secret_key": bool(getattr(business, "paystack_secret_key", None)),
+        "configured": bool(
+            getattr(business, "paystack_public_key", None) and
+            getattr(business, "paystack_secret_key", None)
+        ),
     }

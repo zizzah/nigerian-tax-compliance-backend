@@ -133,6 +133,27 @@ class Settings(BaseSettings):
     # ====================================================================
     VAT_RATE: float = 0.075  # 7.5%
     WHT_RATE: float = 0.05   # 5%
+
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+
+
+    SMTP_HOST:     str  = "smtp.gmail.com"
+    SMTP_PORT:     int  = 587
+    SMTP_USER:     str  = ""
+    SMTP_PASSWORD: str  = ""
+    SMTP_TLS:      bool = True
+    SMTP_SSL:      bool = False
+
+    # Email display
+    FROM_EMAIL:     str = "noreply@taxcompliance.ng"
+    FROM_NAME:      str = "Nigerian Tax Compliance"
+    SUPPORT_EMAIL:  str = "support@taxcompliance.ng"
+    # paystack keys for payment processing
+    PAYSTACK_SECRET_KEY: str = ""
+    PAYSTACK_PUBLIC_KEY: str = ""
+    FRONTEND_URL: str = "http://localhost:3000"
     
     # ====================================================================
     # MONITORING (Optional)

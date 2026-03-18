@@ -4,23 +4,32 @@ Location: app/api/v1/endpoints/invoices.py
 
 Includes all CRUD operations + PDF generation
 """
-from asyncio.log import logger
-from fastapi import APIRouter, Depends, HTTPException, status, Query # type: ignore
-from fastapi.responses import Response # type: ignore
-from sqlalchemy.orm import Session  # type: ignore
-from sqlalchemy import or_, and_, func # type: ignore
-from sqlalchemy.exc import IntegrityError  # type: ignore
-from typing import Optional
 import uuid
 import math
-from datetime import date, datetime, timedelta
 import time
+import os
+import urllib.request
+import tempfile
+import logging
 from io import BytesIO
+from typing import Optional
+from datetime import date, datetime, timedelta
 
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks  # type: ignore
+from fastapi.responses import Response  # type: ignore
+from sqlalchemy.orm import Session  # type: ignore
+from sqlalchemy import or_, and_, func, text, select  # type: ignore
+from sqlalchemy.exc import IntegrityError  # type: ignore
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+from app.core.email import send_invoice_email
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.models.business import Business
+from app.models.business import Business as BusinessModel
 from app.models.customer import Customer
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.invoice_item import InvoiceItem
@@ -35,12 +44,6 @@ from app.schemas.invoice import (
     InvoiceCancelRequest,
     InvoiceStatistics
 )
-from sqlalchemy import select # type: ignore
-from app.models.business import Business as BusinessModel
-from app.models.invoice import Invoice
-import logging
-import time
-
 
 # PDF Generation imports
 try:
@@ -175,231 +178,224 @@ def generate_unique_invoice_number(db: Session, business: Business, max_retries:
 
 def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Customer) -> BytesIO:
     """
-    Generate a professional PDF invoice
-    
-    Args:
-        invoice: Invoice object with items loaded
-        business: Business object
-        customer: Customer object
-    
-    Returns:
-        BytesIO: PDF file as bytes
+    Generate a professional PDF invoice using the business's brand colours.
+    primary_color   -> accent (header bar, divider line, totals highlight)
+    secondary_color -> table header background
     """
     if not PDF_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="PDF generation not available. Install reportlab: pip install reportlab"
         )
-    
-    # Create PDF in memory
+
+    # Brand colours
+    primary_hex   = (getattr(business, 'primary_color',   None) or '#c8952a').strip()
+    secondary_hex = (getattr(business, 'secondary_color', None) or '#1a6b4a').strip()
+    if not primary_hex.startswith('#') or len(primary_hex) != 7:
+        primary_hex = '#c8952a'
+    if not secondary_hex.startswith('#') or len(secondary_hex) != 7:
+        secondary_hex = '#1a6b4a'
+
+    col_primary   = colors.HexColor(primary_hex)
+    col_secondary = colors.HexColor(secondary_hex)
+    col_ink       = colors.HexColor('#0f0e0b')
+    col_dim       = colors.HexColor('#6b6560')
+    col_border    = colors.HexColor('#ddd9cf')
+
+    def _tint(hex_color: str, factor: float = 0.10) -> colors.Color:
+        r = int(hex_color[1:3], 16); g = int(hex_color[3:5], 16); b = int(hex_color[5:7], 16)
+        return colors.Color(int(255+(r-255)*factor)/255, int(255+(g-255)*factor)/255, int(255+(b-255)*factor)/255)
+
+    col_row_alt = _tint(primary_hex, 0.08)
+
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, 
-                           rightMargin=20*mm, leftMargin=20*mm,
-                           topMargin=20*mm, bottomMargin=20*mm)
-    
-    # Container for PDF elements
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=20*mm, leftMargin=20*mm,
+                            topMargin=20*mm, bottomMargin=20*mm)
     elements = []
-    styles = getSampleStyleSheet()
-    
-    # Custom styles
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        textColor=colors.HexColor('#2C3E50'),
-        spaceAfter=12,
-        alignment=TA_LEFT
+    styles   = getSampleStyleSheet()
+
+    normal_style  = ParagraphStyle('N', parent=styles['Normal'], fontSize=9, textColor=col_ink, leading=13)
+    dim_style     = ParagraphStyle('D', parent=styles['Normal'], fontSize=8, textColor=col_dim, leading=11)
+    heading_style = ParagraphStyle('H', parent=styles['Normal'], fontSize=10, textColor=col_ink, fontName='Helvetica-Bold')
+    label_style   = ParagraphStyle('L', parent=styles['Normal'], fontSize=7.5, textColor=col_dim, fontName='Helvetica', leading=10)
+
+    # Logo
+    logo_img = None
+    tmp_path = None
+    if getattr(business, 'logo_url', None):
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+                tmp_path = tmp.name
+            req = urllib.request.Request(business.logo_url, headers={'User-Agent': 'Mozilla/5.0'})  # type: ignore
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                open(tmp_path, 'wb').write(resp.read())
+            logo_img = Image(tmp_path, width=1.4*inch, height=0.7*inch)
+            logo_img.hAlign = 'LEFT'
+        except Exception as e:
+            logger.warning(f"Could not load logo: {e}")
+            logo_img = None
+
+    # Header: logo/name left | INVOICE right
+    brand_para = Paragraph(
+        f"<b>{business.business_name or 'Business'}</b>",  # type: ignore
+        ParagraphStyle('Brand', parent=styles['Normal'], fontSize=15, textColor=col_ink, fontName='Helvetica-Bold')
     )
-    
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=12,
-        textColor=colors.HexColor('#34495E'),
-        spaceAfter=6,
-        alignment=TA_LEFT
+    invoice_label = Paragraph(
+        f"<font color='{primary_hex}' size='26'><b>INVOICE</b></font>"
+        f"<br/><font size='9' color='#6b6560'>{invoice.invoice_number}</font>",
+        ParagraphStyle('InvLabel', parent=styles['Normal'], fontSize=26, alignment=TA_RIGHT)
     )
-    
-    normal_style = ParagraphStyle(
-        'CustomNormal',
-        parent=styles['Normal'],
-        fontSize=10,
-        textColor=colors.HexColor('#2C3E50')
-    )
-    
-    # ========== HEADER ==========
-    # Business name and invoice title
-    elements.append(Paragraph(business.business_name or "Business Name", title_style)) # type: ignore
-    elements.append(Paragraph(f"<b>INVOICE {invoice.invoice_number}</b>", heading_style))
-    elements.append(Spacer(1, 12))
-    
-    # ========== BUSINESS & CUSTOMER INFO ==========
-    # Create a table for business and customer info side by side
-    info_data = [
-        [
-            Paragraph("<b>From:</b>", normal_style),
-            Paragraph("<b>Bill To:</b>", normal_style)
-        ],
-        [
-            Paragraph(f"{business.business_name or 'N/A'}<br/>"
-                     f"{business.address or ''}<br/>"
-                     f"{business.city or ''}, {business.state or ''}<br/>"
-                     f"TIN: {business.tin or 'N/A'}<br/>"
-                     f"Phone: {business.phone or 'N/A'}", normal_style),
-            Paragraph(f"{customer.name}<br/>"
-                     f"{customer.address or ''}<br/>"
-                     f"{customer.city or ''}, {customer.state or ''}<br/>"
-                     f"TIN: {customer.tin or 'N/A'}<br/>"
-                     f"Phone: {customer.phone or 'N/A'}", normal_style)
-        ]
-    ]
-    
-    info_table = Table(info_data, colWidths=[3*inch, 3*inch])
-    info_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+    left_cell = [logo_img, Spacer(1, 4), brand_para] if logo_img else [brand_para]
+    header_table = Table([[left_cell, invoice_label]], colWidths=[3.5*inch, 3.5*inch])
+    header_table.setStyle(TableStyle([
+        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN',        (1, 0), (1, 0),   'RIGHT'),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 0),
         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('LINEBELOW',    (0, 0), (-1, 0),  2, col_primary),
+        ('BOTTOMPADDING',(0, 0), (-1, 0),  10),
     ]))
-    
+    elements.append(header_table)
+    elements.append(Spacer(1, 14))
+
+    # From / Bill To
+    def _addr(lines):
+        return Paragraph('<br/>'.join(l for l in lines if l), normal_style)
+
+    biz_lines = [
+        f"<b>{business.business_name or ''}</b>",  # type: ignore
+        business.address or '',  # type: ignore
+        f"{business.city or ''}{', ' + business.state if business.state else ''}",  # type: ignore
+        f"TIN: {business.tin}" if business.tin else '',  # type: ignore
+        business.phone or '',  # type: ignore
+    ]
+    cus_lines = [
+        f"<b>{customer.name}</b>",
+        customer.address or '',
+        f"{customer.city or ''}{', ' + customer.state if customer.state else ''}",  # type: ignore
+        f"TIN: {customer.tin}" if customer.tin else '',  # type: ignore
+        customer.phone or '',
+    ]
+    info_table = Table(
+        [[Paragraph('<b>FROM</b>', label_style), Paragraph('<b>BILL TO</b>', label_style)],
+         [_addr(biz_lines), _addr(cus_lines)]],
+        colWidths=[3.5*inch, 3.5*inch]
+    )
+    info_table.setStyle(TableStyle([
+        ('VALIGN',       (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING',(0, 0), (-1, 0),  4),
+    ]))
     elements.append(info_table)
-    elements.append(Spacer(1, 20))
-    
-    # ========== INVOICE DETAILS ==========
-    details_data = [
-        [Paragraph("<b>Invoice Date:</b>", normal_style), 
-         Paragraph(f"{invoice.issue_date.strftime('%B %d, %Y')}", normal_style),
-         Paragraph("<b>Due Date:</b>", normal_style),
-         Paragraph(f"{invoice.due_date.strftime('%B %d, %Y')}", normal_style)],
-        [Paragraph("<b>Status:</b>", normal_style),
-         Paragraph(f"{invoice.status.value}", normal_style),
-         Paragraph("<b>Payment Terms:</b>", normal_style),
-         Paragraph(f"{invoice.payment_terms or 'N/A'}", normal_style)]
-    ]
-    
-    details_table = Table(details_data, colWidths=[1.2*inch, 1.8*inch, 1.2*inch, 1.8*inch])
-    details_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+    elements.append(Spacer(1, 12))
+
+    # Meta bar
+    due_str   = invoice.due_date.strftime('%d %b %Y')   if invoice.due_date   else '—'   # type: ignore
+    issue_str = invoice.issue_date.strftime('%d %b %Y') if invoice.issue_date else '—'   # type: ignore
+    try:    status_val = invoice.status.value
+    except: status_val = str(invoice.status)
+
+    meta_table = Table([[
+        Paragraph(f'<font color="white" size="7">ISSUE DATE</font><br/><font color="white" size="9"><b>{issue_str}</b></font>', styles['Normal']),
+        Paragraph(f'<font color="white" size="7">DUE DATE</font><br/><font color="white" size="9"><b>{due_str}</b></font>', styles['Normal']),
+        Paragraph(f'<font color="white" size="7">STATUS</font><br/><font color="white" size="9"><b>{status_val}</b></font>', styles['Normal']),
+        Paragraph(f'<font color="white" size="7">PAYMENT TERMS</font><br/><font color="white" size="9"><b>{invoice.payment_terms or "—"}</b></font>', styles['Normal']),
+    ]], colWidths=[1.75*inch]*4)
+    meta_table.setStyle(TableStyle([
+        ('BACKGROUND',   (0, 0), (-1, -1), col_secondary),
+        ('LEFTPADDING',  (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+        ('TOPPADDING',   (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 8),
+        ('VALIGN',       (0, 0), (-1, -1), 'MIDDLE'),
     ]))
-    
-    elements.append(details_table)
-    elements.append(Spacer(1, 20))
-    
-    # ========== LINE ITEMS TABLE ==========
-    # Table headers
-    items_data = [
-        [Paragraph("<b>Description</b>", normal_style),
-         Paragraph("<b>Qty</b>", normal_style),
-         Paragraph("<b>Unit Price</b>", normal_style),
-         Paragraph("<b>Tax</b>", normal_style),
-         Paragraph("<b>Amount</b>", normal_style)]
-    ]
-    
-    # Add invoice items
+    elements.append(meta_table)
+    elements.append(Spacer(1, 16))
+
+    # Line items
+    hdr_style = ParagraphStyle('TH', parent=styles['Normal'], fontSize=7.5, textColor=colors.white, fontName='Helvetica-Bold')
+    def _p(text, st=normal_style): return Paragraph(str(text), st)
+
+    items_data = [[_p('DESCRIPTION', hdr_style), _p('QTY', hdr_style), _p('UNIT PRICE', hdr_style), _p('TAX', hdr_style), _p('AMOUNT', hdr_style)]]
     for item in invoice.items:
         items_data.append([
-            Paragraph(item.description or "Item", normal_style),
-            Paragraph(f"{item.quantity}", normal_style),
-            Paragraph(f"₦{item.unit_price:,.2f}", normal_style),
-            Paragraph(f"{item.tax_rate}%", normal_style),
-            Paragraph(f"₦{item.line_total:,.2f}", normal_style)
+            _p(item.description or 'Item'),
+            _p(str(item.quantity)),
+            _p(f'\u20a6{float(item.unit_price):,.2f}'),
+            _p(f'{item.tax_rate or 0}%'),
+            _p(f'\u20a6{float(item.line_total):,.2f}'),
         ])
-    
-    items_table = Table(items_data, colWidths=[3*inch, 0.6*inch, 1*inch, 0.6*inch, 1*inch])
+    items_table = Table(items_data, colWidths=[3.1*inch, 0.55*inch, 1.05*inch, 0.6*inch, 0.9*inch], repeatRows=1)
     items_table.setStyle(TableStyle([
-        # Header row
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495E')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, 0), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-        ('TOPPADDING', (0, 0), (-1, 0), 8),
-        
-        # Data rows
-        ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
-        ('ALIGN', (0, 1), (0, -1), 'LEFT'),
-        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 1), (-1, -1), 9),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F8F9FA')]),
-        ('TOPPADDING', (0, 1), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
-        
-        # Grid
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('LINEBELOW', (0, 0), (-1, 0), 2, colors.HexColor('#34495E')),
+        ('BACKGROUND',    (0, 0), (-1, 0),  col_primary),
+        ('ALIGN',         (1, 0), (-1, -1), 'RIGHT'),
+        ('ALIGN',         (0, 0), (0, -1),  'LEFT'),
+        ('TOPPADDING',    (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
+        ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, col_row_alt]),
+        ('LINEBELOW',     (0, 1), (-1, -2), 0.3, col_border),
+        ('FONTSIZE',      (0, 1), (-1, -1), 9),
     ]))
-    
     elements.append(items_table)
-    elements.append(Spacer(1, 20))
-    
-    # ========== TOTALS ==========
-    totals_data = [
-        ['', '', '', Paragraph("<b>Subtotal:</b>", normal_style), 
-         Paragraph(f"₦{invoice.subtotal:,.2f}", normal_style)],
-    ]
-    
-    if invoice.discount_amount > 0: # type: ignore
-        totals_data.append([
-            '', '', '', Paragraph("<b>Discount:</b>", normal_style),
-            Paragraph(f"-₦{invoice.discount_amount:,.2f}", normal_style)
-        ])
-    
-    totals_data.extend([
-        ['', '', '', Paragraph("<b>Tax:</b>", normal_style),
-         Paragraph(f"₦{invoice.tax_amount:,.2f}", normal_style)],
-        ['', '', '', Paragraph("<b>TOTAL:</b>", heading_style),
-         Paragraph(f"<b>₦{invoice.total_amount:,.2f}</b>", heading_style)],
-    ])
-    
-    if invoice.paid_amount > 0: # type: ignore
-        totals_data.extend([
-            ['', '', '', Paragraph("<b>Paid:</b>", normal_style),
-             Paragraph(f"₦{invoice.paid_amount:,.2f}", normal_style)],
-            ['', '', '', Paragraph("<b>Balance Due:</b>", heading_style),
-             Paragraph(f"<b>₦{invoice.outstanding_amount:,.2f}</b>", heading_style)],
-        ])
-    
-    totals_table = Table(totals_data, colWidths=[2*inch, 1*inch, 1*inch, 1.2*inch, 1*inch])
+    elements.append(Spacer(1, 12))
+
+    # Totals
+    def _total_row(label, amount, bold=False, highlight=False):
+        ls = ParagraphStyle('tl', parent=styles['Normal'], fontSize=9,
+                            fontName='Helvetica-Bold' if bold else 'Helvetica',
+                            textColor=col_primary if highlight else col_ink, alignment=TA_RIGHT)
+        vs = ParagraphStyle('tv', parent=styles['Normal'], fontSize=9,
+                            fontName='Helvetica-Bold' if bold else 'Helvetica',
+                            textColor=col_primary if highlight else col_ink, alignment=TA_RIGHT)
+        return ['', '', '', Paragraph(label, ls), Paragraph(amount, vs)]
+
+    totals_data = [_total_row('Subtotal', f'\u20a6{float(invoice.subtotal):,.2f}')]  # type: ignore
+    if float(invoice.discount_amount or 0) > 0:  # type: ignore
+        totals_data.append(_total_row('Discount', f'-\u20a6{float(invoice.discount_amount):,.2f}'))  # type: ignore
+    totals_data.append(_total_row('VAT', f'\u20a6{float(invoice.tax_amount):,.2f}'))  # type: ignore
+    totals_data.append(_total_row('TOTAL DUE', f'\u20a6{float(invoice.total_amount):,.2f}', bold=True, highlight=True))  # type: ignore
+    if float(invoice.paid_amount or 0) > 0:  # type: ignore
+        totals_data.append(_total_row('Paid', f'\u20a6{float(invoice.paid_amount):,.2f}'))  # type: ignore
+        totals_data.append(_total_row('Balance Due', f'\u20a6{float(invoice.outstanding_amount):,.2f}', bold=True, highlight=True))  # type: ignore
+
+    total_row_idx = next(i for i, r in enumerate(totals_data) if 'TOTAL DUE' in r[3].text)
+    totals_table = Table(totals_data, colWidths=[2*inch, 1*inch, 1*inch, 1.4*inch, 0.8*inch])
     totals_table.setStyle(TableStyle([
-        ('ALIGN', (3, 0), (-1, -1), 'RIGHT'),
-        ('FONTNAME', (3, 0), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (3, 0), (-1, -1), 10),
-        ('TOPPADDING', (3, 0), (-1, -1), 3),
-        ('BOTTOMPADDING', (3, 0), (-1, -1), 3),
-        ('LINEABOVE', (3, -2), (-1, -2), 2, colors.HexColor('#34495E')),
+        ('ALIGN',        (3, 0), (-1, -1), 'RIGHT'),
+        ('TOPPADDING',   (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING',(0, 0), (-1, -1), 3),
+        ('LINEABOVE',    (3, total_row_idx), (-1, total_row_idx), 1.5, col_primary),
+        ('LINEBELOW',    (3, total_row_idx), (-1, total_row_idx), 1.5, col_primary),
     ]))
-    
     elements.append(totals_table)
-    
-    # ========== NOTES ==========
-    if invoice.notes: # type: ignore
-        elements.append(Spacer(1, 20))
-        elements.append(Paragraph("<b>Notes:</b>", heading_style))
-        elements.append(Paragraph(invoice.notes, normal_style)) # type: ignore
-    
-    # ========== FOOTER ==========
-    elements.append(Spacer(1, 30))
-    footer_style = ParagraphStyle(
-        'Footer',
-        parent=styles['Normal'],
-        fontSize=8,
-        textColor=colors.grey,
-        alignment=TA_CENTER
-    )
+
+    if invoice.notes:  # type: ignore
+        elements.append(Spacer(1, 16))
+        elements.append(Paragraph('<b>Notes</b>', heading_style))
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(invoice.notes, normal_style))  # type: ignore
+
+    elements.append(Spacer(1, 28))
     elements.append(Paragraph(
-        f"Thank you for your business!<br/>"
-        f"For questions, contact {business.email or business.phone or 'us'}",
-        footer_style
+        f'<font color="{primary_hex}">\u2014 </font>'
+        f'Thank you for your business! '
+        f'Questions? Contact {business.email or business.phone or "us"}',  # type: ignore
+        ParagraphStyle('Foot', parent=styles['Normal'], fontSize=8, textColor=col_dim, alignment=TA_CENTER)
     ))
-    
-    # Build PDF
+
     doc.build(elements)
-    
-    # Get PDF bytes
+    try:
+        if tmp_path:
+            os.unlink(tmp_path)
+    except Exception:
+        pass
     buffer.seek(0)
     return buffer
+
 
 
 # ============================================================================
@@ -463,6 +459,36 @@ async def create_invoice(
                 product = db.query(Product).filter(Product.id == item_data.product_id).first()
                 if product:
                     product.increment_usage()
+                    # Record stock OUT movement for inventory tracking
+                    if product.track_inventory: # type: ignore
+                        try:
+                            db.execute(text("""
+                                INSERT INTO stock_movements
+                                    (id, business_id, product_id, invoice_id,
+                                     movement_type, quantity, unit_cost, note, movement_date)
+                                VALUES
+                                    (gen_random_uuid(), :biz_id, :product_id, :invoice_id,
+                                     'OUT', :qty, :cost, :note, :dt)
+                            """), {
+                                "biz_id":     str(invoice.business_id),
+                                "product_id": str(product.id),
+                                "invoice_id": str(invoice.id),
+                                "qty":        float(item_data.quantity),
+                                "cost":       float(product.cost_price) if product.cost_price else None, # type: ignore
+                                "note":       "Sale - " + invoice.invoice_number,
+                                "dt":         invoice.issue_date or date.today(),
+                            })
+                            # Sync available stock on product
+                            new_qty = db.execute(text("""
+                                SELECT
+                                    COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END),0)
+                                  - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END),0)
+                                FROM stock_movements
+                                WHERE product_id = :pid
+                            """), {"pid": str(product.id)}).scalar()
+                            product.quantity_in_stock = float(new_qty or 0) # type: ignore
+                        except Exception:
+                            pass  # stock_movements table may not exist yet
         
         db.flush()
         db.refresh(invoice)
@@ -869,3 +895,122 @@ async def download_invoice_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate PDF: {str(e)}"
         )
+
+class SendInvoiceRequest(BaseModel):
+    """Request body for POST /invoices/{id}/send"""
+    message: Optional[str] = None
+    cc:      Optional[str] = None
+
+
+def _fmt_ngn(amount) -> str:
+    try:
+        return f"\u20a6{float(amount):,.0f}"
+    except (TypeError, ValueError):
+        return "\u20a60"
+
+
+def _fmt_date_str(d) -> str:
+    if d is None:
+        return "\u2014"
+    if hasattr(d, 'strftime'):
+        return d.strftime("%d %B %Y")
+    return str(d)
+
+
+@router.post("/{invoice_id}/send", status_code=status.HTTP_200_OK)
+def send_invoice(
+    invoice_id: uuid.UUID,
+    body: SendInvoiceRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Email an invoice to the customer with PDF attached."""
+    business = get_user_business(db, current_user.id) # type: ignore
+
+    invoice = db.query(Invoice).filter(
+        Invoice.id == invoice_id,
+        Invoice.business_id == business.id
+    ).first()
+
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if invoice.status == "DRAFT": # type: ignore
+        raise HTTPException(status_code=400, detail="Cannot email a draft invoice. Finalise it first.")
+
+    if invoice.status == "CANCELLED": # type: ignore
+        raise HTTPException(status_code=400, detail="Cannot email a cancelled invoice.")
+
+    customer = db.query(Customer).filter(Customer.id == invoice.customer_id).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    customer_email = str(customer.email or "")
+    customer_name  = str(customer.name  or "")
+
+    if not customer_email:
+        raise HTTPException(status_code=422, detail=f"Customer '{customer_name}' has no email address.")
+
+    try:
+        pdf_buffer = generate_invoice_pdf(invoice, business, customer)
+        pdf_bytes  = pdf_buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"PDF generation failed, sending without attachment: {e}")
+        pdf_bytes = None
+
+    try:
+        send_invoice_email(
+            to_email       = customer_email,
+            customer_name  = customer_name,
+            invoice_number = str(invoice.invoice_number or ""),
+            invoice_date   = _fmt_date_str(invoice.issue_date),
+            due_date       = _fmt_date_str(invoice.due_date),
+            total_amount   = _fmt_ngn(invoice.total_amount),
+            business_name  = str(business.business_name or ""),
+            pdf_bytes      = pdf_bytes,
+            custom_message = body.message or None,
+            cc_email       = body.cc or None,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected email error: {e}")
+        raise HTTPException(status_code=502, detail="Email delivery failed. Check server logs.")
+
+    setattr(invoice, 'email_sent',    True)
+    setattr(invoice, 'email_sent_at', datetime.utcnow())
+    db.commit()
+    db.refresh(invoice)
+
+    return {
+        "message":      f"Invoice {invoice.invoice_number} emailed to {customer_email}",
+        "email_sent":    True,
+        "email_sent_at": invoice.email_sent_at,
+        "recipient":     customer_email,
+        "pdf_attached":  pdf_bytes is not None,
+    }
+
+
+@router.get("/{invoice_id}/email-status", status_code=status.HTTP_200_OK)
+def get_email_status(
+    invoice_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns whether and when this invoice was last emailed."""
+    business = get_user_business(db, current_user.id) # type: ignore
+
+    invoice = db.query(Invoice).filter(
+        Invoice.id == invoice_id,
+        Invoice.business_id == business.id
+    ).first()
+
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    return {
+        "invoice_id":    str(invoice.id),
+        "email_sent":    bool(invoice.email_sent),
+        "email_sent_at": invoice.email_sent_at,
+    }
