@@ -1,38 +1,19 @@
 services:
   - type: web
     name: nigerian-tax-api
-    env: python
-    buildCommand: pip install -r requirements-main.txt && pip install -r requirements-additional.txt && alembic upgrade head
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    runtime: docker
     plan: free
+    dockerfilePath: ./Dockerfile
     envVars:
       - key: ENVIRONMENT
         value: production
-      - key: PYTHON_VERSION
-        value: 3.12.0
       - key: BACKEND_CORS_ORIGINS
         value: "https://nigerian-tax-compliance.onrender.com,http://localhost:3000,http://localhost:3001"
-```
-
-**2. `requirements-main.txt`** — make sure it exists with all core packages. Based on your code, it needs at minimum:
-```
-fastapi
-uvicorn[standard]
-sqlalchemy
-alembic
-psycopg2-binary
-pydantic
-pydantic-settings
-python-jose[cryptography]
-passlib[bcrypt]
-python-multipart
-slowapi
-bleach
-groq
-requests
-pytesseract
-opencv-python-headless
-Pillow
-numpy
-reportlab
-qstash
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
