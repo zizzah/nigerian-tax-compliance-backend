@@ -7,6 +7,8 @@ Enum names match PostgreSQL types: expensecategory, expensepaymentmethod
 """
 import uuid
 import enum
+from datetime import datetime
+
 
 from sqlalchemy import (
     Column, String, Numeric, Date, Boolean,
@@ -177,8 +179,9 @@ class Expense(Base):
     notes             = Column(Text,    nullable=True)
 
     # Timestamps — TIMESTAMP in DB
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 
     # Relationships
     business = relationship("Business", back_populates="expenses")
