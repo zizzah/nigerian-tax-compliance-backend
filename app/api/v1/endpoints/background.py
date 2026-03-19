@@ -1,67 +1,67 @@
 """
 Background Task Endpoint (QStash Callback)
 Location: app/api/v1/endpoints/background.py
+
+Downloads the file from Cloudinary URL, runs OCR + Groq extraction,
+saves results back to the document record.
 """
-from fastapi import APIRouter, Request, HTTPException, Depends # type: ignore
-from sqlalchemy.orm import Session # type: ignore
+from fastapi import APIRouter, Request, HTTPException, Depends
+from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.document import Document, ProcessingStatus
 from app.services.ocr.preprocessor import ImagePreprocessor
 from app.services.ocr.extractor import OCRExtractor
 from app.services.ai.groq_extractor import GroqReceiptExtractor
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from decimal import Decimal
-from pathlib import Path
 import logging
 import uuid
 import time
+import tempfile
+import os
+import urllib.request
 
 router = APIRouter(prefix="/background", tags=["Background"])
 logger = logging.getLogger(__name__)
 
 
 def convert_decimals(obj):
-    """Recursively convert Decimal objects to float for JSON serialization"""
+    """Recursively convert Decimal and date objects for JSON serialization."""
     if isinstance(obj, dict):
         return {k: convert_decimals(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [convert_decimals(item) for item in obj]
     elif isinstance(obj, Decimal):
         return float(obj)
+    elif isinstance(obj, (date, datetime)):
+        return obj.isoformat()
     return obj
 
 
+def _ext_from_mimetype(mime: str) -> str:
+    mapping = {
+        "image/png":       ".png",
+        "image/jpeg":      ".jpg",
+        "image/jpg":       ".jpg",
+        "application/pdf": ".pdf",
+    }
+    return mapping.get(mime or "", ".jpg")
+
+
 def verify_qstash_signature(request: Request, body: bytes) -> bool:
-    """
-    Verify that the request came from QStash
-    
-    QStash signs each request with your signing keys.
-    We verify the signature to ensure the request is authentic.
-    """
     try:
-        from qstash import Receiver # type: ignore
-        
-        # Create receiver with your signing keys
+        from qstash import Receiver
         receiver = Receiver(
             current_signing_key=settings.QSTASH_CURRENT_SIGNING_KEY,
-            next_signing_key=settings.QSTASH_NEXT_SIGNING_KEY
+            next_signing_key=settings.QSTASH_NEXT_SIGNING_KEY,
         )
-        
-        # Get signature from header
         signature = request.headers.get("Upstash-Signature")
         if not signature:
             logger.error("No Upstash-Signature header found")
             return False
-        
-        # Verify the signature
-        receiver.verify(
-            signature=signature,
-            body=body.decode('utf-8')
-        )
-        
+        receiver.verify(signature=signature, body=body.decode("utf-8"))
         return True
-        
     except Exception as e:
         logger.error(f"QStash signature verification failed: {e}")
         return False
@@ -70,171 +70,163 @@ def verify_qstash_signature(request: Request, body: bytes) -> bool:
 @router.post("/process-document")
 async def process_document(request: Request, db: Session = Depends(get_db)):
     """
-    QStash callback endpoint for document processing
-    
-    This endpoint is called by QStash to process documents in the background
+    QStash callback: download file from Cloudinary, run OCR + Groq, save results.
     """
-    # ====================================================================
-    # VERIFY REQUEST IS FROM QSTASH (SECURITY)
-    # ====================================================================
-    
     body = await request.body()
-    
-    # Verify signature
+
     if not verify_qstash_signature(request, body):
         raise HTTPException(status_code=401, detail="Invalid QStash signature")
-    
-    # ====================================================================
-    # GET PAYLOAD
-    # ====================================================================
-    
-    payload = await request.json()
-    document_id = payload.get("document_id")
-    
+
+    payload      = await request.json()
+    document_id  = payload.get("document_id")
+
     if not document_id:
         raise HTTPException(status_code=400, detail="document_id is required")
-    
+
     logger.info(f"Processing document: {document_id}")
-    
-    # ====================================================================
-    # PROCESS DOCUMENT
-    # ====================================================================
-    
+
     document = None
-    
+    tmp_path = None
+
     try:
-        # Get document
         document = db.query(Document).filter(
             Document.id == uuid.UUID(document_id)
         ).first()
-        
+
         if not document:
             raise ValueError(f"Document {document_id} not found")
-        
-        # Update status to PROCESSING
-        document.status = ProcessingStatus.PROCESSING
-        document.processing_started_at = datetime.now(timezone.utc)
+
+        document.status = ProcessingStatus.PROCESSING # type: ignore
+        document.processing_started_at = datetime.now(timezone.utc) # type: ignore
         db.commit()
-        
+
         start_time = time.time()
-        
-        # Step 1: Preprocess image
+
+        # ── Download from Cloudinary ──────────────────────────────────────────
+        # document.file_path is the Cloudinary secure URL
+        cloudinary_url = document.file_path
+        logger.info(f"Downloading from Cloudinary: {cloudinary_url}")
+
+        ext = _ext_from_mimetype(document.file_type) # type: ignore
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp_path = tmp.name
+
+        req = urllib.request.Request(
+            cloudinary_url, # type: ignore
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            with open(tmp_path, "wb") as f:
+                f.write(resp.read())
+
+        # ── Step 1: Preprocess ────────────────────────────────────────────────
         logger.info("Step 1: Preprocessing image...")
         preprocessor = ImagePreprocessor()
-        
-        file_path = Path(document.file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {document.file_path}")
-        
-        preprocessed_image = preprocessor.preprocess(str(file_path))
-        
-        # Step 2: Run OCR
+        preprocessed_image = preprocessor.preprocess(tmp_path)
+
+        # ── Step 2: OCR ───────────────────────────────────────────────────────
         logger.info("Step 2: Running OCR...")
         ocr = OCRExtractor()
         ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
-        
-        document.ocr_raw_text = ocr_text
-        document.ocr_confidence = ocr_confidence
+
+        document.ocr_raw_text  = ocr_text # type: ignore
+        document.ocr_confidence = ocr_confidence # type: ignore
         db.commit()
-        
-        logger.info(f"OCR confidence: {ocr_confidence:.2%}")
-        
+
         if not ocr_text or len(ocr_text.strip()) < 10:
-            raise ValueError("OCR extracted no meaningful text from image")
-        
-        # Step 3: AI extraction with Groq
+            raise ValueError("OCR extracted no meaningful text")
+
+        # ── Step 3: Groq AI extraction ────────────────────────────────────────
         logger.info("Step 3: AI extraction with Groq...")
         groq = GroqReceiptExtractor()
         extracted_data = groq.extract_receipt_data(ocr_text=ocr_text)
-        
-        # Step 4: Save extracted data
-        logger.info("Step 4: Saving extracted data...")
-        
-        # Vendor information
-        document.vendor_name = extracted_data.get('vendor_name')
-        document.vendor_tin = extracted_data.get('vendor_tin')
-        document.vendor_address = extracted_data.get('vendor_address')
-        document.vendor_phone = extracted_data.get('vendor_phone')
-        
-        # Document information
-        document.document_number = extracted_data.get('document_number')
-        document.document_date = extracted_data.get('document_date')
-        
-        # Line items
-        line_items_raw = extracted_data.get('line_items', [])
-        document.line_items = convert_decimals(line_items_raw)
-        
-        # Financial data
-        document.subtotal = extracted_data.get('subtotal', 0)
-        document.vat_amount = extracted_data.get('vat_amount', 0)
-        document.total_amount = extracted_data.get('total_amount', 0)
-        document.vat_rate = extracted_data.get('vat_rate', 7.5)
-        
-        # Payment information
-        document.payment_method = extracted_data.get('payment_method')
-        document.payment_reference = extracted_data.get('payment_reference')
-        
-        # Auto-categorize
-        if not extracted_data.get('category') and document.vendor_name:
-            try:
-                line_items = document.line_items or []
-                description = line_items[0].get('description', '') if line_items else '' # type: ignore
-                category = groq.categorize_expense(description, document.vendor_name) # type: ignore
-                document.category = category
-            except Exception as e:
-                logger.warning(f"Auto-categorization failed: {e}")
-                document.category = 'Other'
+
+        # ── Step 4: Save results ──────────────────────────────────────────────
+        document.vendor_name     = extracted_data.get("vendor_name") # type: ignore
+        document.vendor_tin      = extracted_data.get("vendor_tin") # type: ignore
+        document.vendor_address  = extracted_data.get("vendor_address") # type: ignore
+        document.vendor_phone    = extracted_data.get("vendor_phone") # type: ignore
+        document.document_number = extracted_data.get("document_number") # type: ignore
+
+        doc_date = extracted_data.get("document_date")
+        if doc_date:
+            if isinstance(doc_date, date):
+                document.document_date = doc_date # type: ignore
+            elif isinstance(doc_date, str):
+                try:
+                    document.document_date = datetime.strptime(doc_date, "%Y-%m-%d").date() # type: ignore
+                except Exception:
+                    document.document_date = None # type: ignore
         else:
-            document.category = extracted_data.get('category', 'Other')
-        
-        # Confidence and review flags
-        document.confidence_score = extracted_data.get('confidence_score')
-        document.requires_review = extracted_data.get('requires_review', False)
-        
-        # Save full AI response
-        document.ai_extracted_data = convert_decimals(extracted_data)
-        document.ai_model_used = "llama-3.3-70b-versatile"
-        
-        # Mark as completed
-        document.status = ProcessingStatus.COMPLETED
-        document.processing_completed_at = datetime.now(timezone.utc)
-        
+            document.document_date = None # type: ignore
+
+        document.line_items        = convert_decimals(extracted_data.get("line_items", [])) # type: ignore
+        document.subtotal          = extracted_data.get("subtotal", 0) # type: ignore
+        document.vat_amount        = extracted_data.get("vat_amount", 0) # type: ignore
+        document.total_amount      = extracted_data.get("total_amount", 0) # type: ignore
+        document.vat_rate          = extracted_data.get("vat_rate", 7.5) # type: ignore
+        document.payment_method    = extracted_data.get("payment_method") # type: ignore
+        document.payment_reference = extracted_data.get("payment_reference") # type: ignore
+
+        if not extracted_data.get("category") and document.vendor_name: # type: ignore
+            try:
+                items       = document.line_items or []
+                description = items[0].get("description", "") if items else "" # type: ignore
+                document.category = groq.categorize_expense(description, document.vendor_name) # type: ignore
+            except Exception:
+                document.category = "Other" # type: ignore
+        else:
+            document.category = extracted_data.get("category", "Other")
+
+        document.confidence_score  = extracted_data.get("confidence_score") # type: ignore
+        document.requires_review   = extracted_data.get("requires_review", False)
+        document.ai_extracted_data = convert_decimals(extracted_data) # type: ignore
+        document.ai_model_used     = "llama-3.3-70b-versatile" # type: ignore
+
         processing_duration = time.time() - start_time
-        document.processing_duration_seconds = processing_duration
-        
+        document.status = ProcessingStatus.COMPLETED # type: ignore
+        document.processing_completed_at    = datetime.now(timezone.utc) # type: ignore
+        document.processing_duration_seconds = processing_duration # type: ignore
+
         db.commit()
-        
-        logger.info(f"✅ Successfully processed: {document.original_filename}")
-        logger.info(f"   Vendor: {document.vendor_name}")
-        logger.info(f"   Total: ₦{float(document.total_amount):,.2f}")
-        logger.info(f"   Processing time: {processing_duration:.2f}s")
-        
+
+        logger.info(
+            f"✅ Processed: {document.original_filename} | "
+            f"Vendor: {document.vendor_name} | "
+            f"Total: ₦{float(document.total_amount):,.2f} | "
+            f"Time: {processing_duration:.2f}s"
+        )
+
         return {
-            "status": "processed",
-            "document_id": str(document.id),
-            "vendor_name": document.vendor_name,
-            "total_amount": float(document.total_amount),
-            "confidence_score": float(document.confidence_score) if document.confidence_score else None,
-            "processing_time": processing_duration
+            "status":           "processed",
+            "document_id":      str(document.id),
+            "vendor_name":      document.vendor_name,
+            "total_amount":     float(document.total_amount),
+            "confidence_score": float(document.confidence_score) if document.confidence_score else None, # type: ignore
+            "processing_time":  processing_duration,
         }
-    
+
     except Exception as e:
         logger.error(f"Document processing failed: {e}", exc_info=True)
-        
+
         if document:
-            document.status = ProcessingStatus.FAILED
-            document.processing_error = str(e)[:500]
-            document.processing_completed_at = datetime.now(timezone.utc)
-            
-            if document.processing_started_at:
-                duration = (
+            document.status = ProcessingStatus.FAILED # type: ignore
+            document.processing_error = str(e)[:500] # type: ignore
+            document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
+
+            if document.processing_started_at: # type: ignore
+                document.processing_duration_seconds = (
                     datetime.now(timezone.utc) - document.processing_started_at
                 ).total_seconds()
-                document.processing_duration_seconds = duration
-            
+
             db.commit()
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Processing failed: {str(e)}"
-        )
+
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+    finally:
+        # Always clean up the temp file
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
