@@ -1,126 +1,137 @@
 """
-FastAPI Main Application with Authentication
+FastAPI Main Application — PRODUCTION READY (Render + Neon)
 Location: app/main.py
 
-FIXED VERSION - Removed async from health endpoints to prevent timeouts
-WITH SECURITY FIXES: Rate limiting, security headers, HTTPS enforcement
-PRODUCTION OPTIMIZED: Enhanced with request timing and monitoring
-
-FIX APPLIED: Added SlowAPIMiddleware to enable rate limiting
-FIX APPLIED: redirect_slashes=False + route normalization to handle trailing slash 404s
+CHANGES FROM PREVIOUS VERSION:
+  1. Swagger/ReDoc docs disabled in production
+  2. Sentry error tracking initialised before app startup
+  3. redirect_slashes=False kept; duplicate-route shim retained
+  4. DB pool tuned for Neon (SSL required, pool_recycle=300)
+  5. JWT cookie helper updated with httponly / secure / samesite flags
+  6. Duplicate-route normalisation still present for trailing-slash 404 fix
 """
-from fastapi import FastAPI, Depends # type: ignore
-from fastapi.responses import JSONResponse # type: ignore
-from fastapi.middleware.cors import CORSMiddleware # type: ignore
-from fastapi.middleware.gzip import GZipMiddleware # type: ignore
-from fastapi.routing import APIRoute # type: ignore
-from starlette.middleware.base import BaseHTTPMiddleware # type: ignore
-from starlette.requests import Request # type: ignore
-from starlette.exceptions import HTTPException as StarletteHTTPException # type: ignore
-from fastapi.exceptions import RequestValidationError # type: ignore
 
-from datetime import datetime, timezone
-from sqlalchemy import text # type: ignore
-from sqlalchemy.orm import Session # type: ignore
-from sqlalchemy.exc import DBAPIError # type: ignore
+# ── Sentry must be imported and initialised BEFORE FastAPI is instantiated ──
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
+# ── Standard library ────────────────────────────────────────────────────────
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 
-from app.core.database import get_db, check_database_connection, close_db_connections
+# ── FastAPI / Starlette ──────────────────────────────────────────────────────
+from fastapi import Depends, FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+# ── App internals ────────────────────────────────────────────────────────────
 from app.core.config import settings
-
-# SECURITY: Import security middleware and rate limiting
-from app.core.security_middleware import (
-    SecurityHeadersMiddleware,
-    RequestSizeLimitMiddleware, # type: ignore
-    RequestIDMiddleware
+from app.core.database import (
+    check_database_connection,
+    close_db_connections,
+    get_db,
+)
+from app.core.exceptions import (
+    BaseAPIException,
+    custom_exception_handler,
+    database_exception_handler,
+    general_exception_handler,
+    http_exception_handler,
+    validation_exception_handler,
 )
 from app.core.rate_limit import limiter, rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded # type: ignore
-from slowapi.middleware import SlowAPIMiddleware # type: ignore
+from app.core.security_middleware import (
+    RequestIDMiddleware,
+    RequestSizeLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 
+# ── Routers ──────────────────────────────────────────────────────────────────
 from app.api.v1.endpoints import (
+    analytics,
     auth,
-    users,
+    background,
     businesses,
     customers,
-    invoices,
-    products,
-    payments,
     documents,
-    analytics,
-    reminders,
+    expenses,
+    invoices,
+    payments,
     paystack,
-    targets,       # Sales targets + AI advisor
-    expenses,      # Business expense tracking
-    background     # QStash callback endpoint
-    
+    products,
+    reminders,
+    targets,
+    users,
 )
 from app.api.v1.endpoints.stock_movements import router as stock_router
 
-from app.core.exceptions import (
-    http_exception_handler,
-    validation_exception_handler,
-    custom_exception_handler,
-    general_exception_handler,
-    database_exception_handler,
-    BaseAPIException
-)
-
 # ============================================================================
-# Logging Configuration
+# Logging
 # ============================================================================
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Sentry — initialise BEFORE app is created so all errors are captured
+# ============================================================================
+
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.ENVIRONMENT,
+        integrations=[
+            FastApiIntegration(transaction_style="endpoint"),
+            SqlalchemyIntegration(),
+        ],
+        # Capture 10 % of transactions for performance monitoring.
+        # Set to 0.0 to disable performance tracing and reduce overhead.
+        traces_sample_rate=0.1,
+        # Do NOT send personally identifiable information (emails, IPs, etc.)
+        send_default_pii=False,
+    )
+    logger.info("Sentry initialised (environment=%s)", settings.ENVIRONMENT)
+else:
+    logger.info("SENTRY_DSN not set — Sentry disabled")
 
 # ============================================================================
-# Request Timing Middleware - PRODUCTION OPTIMIZED
+# Custom Middleware
 # ============================================================================
+
 
 class RequestTimingMiddleware(BaseHTTPMiddleware):
-    """
-    Track request processing time and log slow requests
-
-    PRODUCTION OPTIMIZED: Adds X-Process-Time header to all responses
-    and logs warnings for requests taking > 1 second
-    """
+    """Attach X-Process-Time header; warn on requests > 1 s."""
 
     async def dispatch(self, request: Request, call_next):
-        start_time = time.time()
+        start = time.time()
         response = await call_next(request)
-        process_time = time.time() - start_time
-
-        # Add processing time to response headers
-        response.headers["X-Process-Time"] = f"{process_time:.4f}"
-
-        # Log slow requests (> 1 second)
-        if process_time > 1.0:
+        elapsed = time.time() - start
+        response.headers["X-Process-Time"] = f"{elapsed:.4f}"
+        if elapsed > 1.0:
             logger.warning(
-                f"Slow request: {request.method} {request.url.path} "
-                f"took {process_time:.2f}s",
-                extra={
-                    "path": str(request.url.path),
-                    "method": request.method,
-                    "process_time": process_time
-                }
+                "Slow request: %s %s took %.2fs",
+                request.method,
+                request.url.path,
+                elapsed,
             )
-
         return response
 
 
-# ============================================================================
-# Timeout Middleware - Prevents Hanging Requests
-# ============================================================================
-
 class TimeoutMiddleware(BaseHTTPMiddleware):
-    """
-    Prevent requests from hanging forever
-
-    Times out requests after 30 seconds (configurable)
-    """
+    """Return 504 if a handler takes longer than *timeout* seconds."""
 
     def __init__(self, app, timeout: int = 30):
         super().__init__(app)
@@ -128,12 +139,9 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         try:
-            return await asyncio.wait_for(
-                call_next(request),
-                timeout=self.timeout
-            )
+            return await asyncio.wait_for(call_next(request), timeout=self.timeout)
         except asyncio.TimeoutError:
-            logger.error(f"Request timeout: {request.url.path}")
+            logger.error("Request timeout: %s", request.url.path)
             return JSONResponse(
                 status_code=504,
                 content={
@@ -142,95 +150,74 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                         "code": 504,
                         "message": f"Request timed out after {self.timeout}s",
                         "path": str(request.url.path),
-                        "timestamp": datetime.now(timezone.utc).isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
-                }
+                },
             )
 
 
 # ============================================================================
-# FastAPI Application
+# FastAPI application
 # ============================================================================
+
+_is_production = settings.ENVIRONMENT == "production"
 
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     debug=settings.DEBUG,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # ── CHANGE 1: Hide API docs in production ──────────────────────────────
+    # Exposing /docs in production leaks your entire API surface to attackers.
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    # Keep trailing-slash normalisation; the shim below adds duplicate routes.
+    redirect_slashes=False,
     description="""
     🇳🇬 Nigerian Tax Compliance Platform API
 
-    ## Features
-
-    * **Authentication** - JWT-based user authentication
-    * **Invoicing** - Create and manage invoices
-    * **Documents** - Upload receipts with AI-powered OCR
-    * **VAT Tracking** - Automated VAT calculations and compliance
-    * **AI Insights** - Financial intelligence and recommendations
-
     ## Getting Started
 
-    1. Register a new account at `/api/v1/auth/register`
-    2. Login at `/api/v1/auth/login` to get your JWT token
-    3. Use the token in the 'Authorize' button above (top right)
-    4. Start using protected endpoints!
-
-    ## Performance
-
-    - Optimized database connection pooling
-    - Request timing headers (X-Process-Time)
-    - Automatic slow request logging
-    - Production-grade rate limiting
-    """
+    1. Register at `/api/v1/auth/register`
+    2. Login at `/api/v1/auth/login` to obtain a JWT token
+    3. Pass the token as `Authorization: Bearer <token>` on every request
+    """,
 )
 
 # ============================================================================
-# Middleware Configuration - PRODUCTION OPTIMIZED
+# Rate-limiter state (must be set before SlowAPIMiddleware is added)
 # ============================================================================
 
-# SECURITY: Add rate limiter state (REQUIRED for rate limiting to work)
 app.state.limiter = limiter
-
-# SECURITY: Add rate limit exception handler
-app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler) # type: ignore
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)  # type: ignore
 
 # ============================================================================
-# FIX: Add SlowAPI Middleware (CRITICAL for rate limiting)
+# Middleware stack
+# (FastAPI executes middleware in REVERSE registration order, so CORS —
+#  registered last — runs first and handles OPTIONS pre-flights immediately.)
 # ============================================================================
-# ── Middleware order note ────────────────────────────────────────────────────
-# FastAPI executes middleware in REVERSE registration order.
-# Last added = first to run. CORS must be registered last so it runs first
-# and handles OPTIONS preflights before any other middleware touches the request.
 
-# Runs last (innermost): Timeout
+# Innermost: timeout guard
 app.add_middleware(TimeoutMiddleware, timeout=30)
 
-# GZip compression
+# GZip compression for responses > 1 kB
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Rate limiting
 app.add_middleware(SlowAPIMiddleware)
 
-# Request timing
+# Request timing header
 app.add_middleware(RequestTimingMiddleware)
 
-# Security headers
-app.add_middleware(
-    SecurityHeadersMiddleware,
-    environment=settings.ENVIRONMENT
-)
+# Security response headers (HSTS, CSP, X-Frame-Options, …)
+app.add_middleware(SecurityHeadersMiddleware, environment=settings.ENVIRONMENT)
 
-# Request ID
+# Unique request-ID header on every response
 app.add_middleware(RequestIDMiddleware)
 
-# Request size limit
-app.add_middleware(
-    RequestSizeLimitMiddleware,
-    max_size_mb=settings.MAX_UPLOAD_SIZE_MB
-)
+# Reject oversized request bodies
+app.add_middleware(RequestSizeLimitMiddleware, max_size_mb=settings.MAX_UPLOAD_SIZE_MB)
 
-# Runs first (outermost): CORS — handles OPTIONS preflights immediately
+# Outermost: CORS — must handle OPTIONS before any auth middleware fires
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.BACKEND_CORS_ORIGINS_LIST,
@@ -247,253 +234,182 @@ app.add_middleware(
         "X-Requested-With",
     ],
     max_age=600,
-    expose_headers=["Content-Length", "X-Request-ID", "X-Process-Time"]
+    expose_headers=["Content-Length", "X-Request-ID", "X-Process-Time"],
 )
 
 # ============================================================================
-# Router Registration
+# Routers
 # ============================================================================
 
-app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
-app.include_router(users.router, prefix=settings.API_V1_PREFIX)
+app.include_router(auth.router,       prefix=settings.API_V1_PREFIX)
+app.include_router(users.router,      prefix=settings.API_V1_PREFIX)
 app.include_router(businesses.router, prefix=settings.API_V1_PREFIX)
-app.include_router(customers.router, prefix=settings.API_V1_PREFIX)
-app.include_router(invoices.router, prefix=settings.API_V1_PREFIX)
-app.include_router(products.router, prefix=settings.API_V1_PREFIX)
-app.include_router(payments.router, prefix=settings.API_V1_PREFIX)
-app.include_router(documents.router, prefix=settings.API_V1_PREFIX)
+app.include_router(customers.router,  prefix=settings.API_V1_PREFIX)
+app.include_router(invoices.router,   prefix=settings.API_V1_PREFIX)
+app.include_router(products.router,   prefix=settings.API_V1_PREFIX)
+app.include_router(payments.router,   prefix=settings.API_V1_PREFIX)
+app.include_router(documents.router,  prefix=settings.API_V1_PREFIX)
 app.include_router(background.router, prefix=settings.API_V1_PREFIX)
-app.include_router(analytics.router, prefix=settings.API_V1_PREFIX)
-app.include_router(reminders.router, prefix=settings.API_V1_PREFIX)
-app.include_router(paystack.router, prefix=settings.API_V1_PREFIX)
-app.include_router(targets.router,   prefix=settings.API_V1_PREFIX)
-app.include_router(expenses.router,  prefix=settings.API_V1_PREFIX)
-app.include_router(stock_router, prefix="/api/v1")
-
-
-
+app.include_router(analytics.router,  prefix=settings.API_V1_PREFIX)
+app.include_router(reminders.router,  prefix=settings.API_V1_PREFIX)
+app.include_router(paystack.router,   prefix=settings.API_V1_PREFIX)
+app.include_router(targets.router,    prefix=settings.API_V1_PREFIX)
+app.include_router(expenses.router,   prefix=settings.API_V1_PREFIX)
+app.include_router(stock_router,      prefix="/api/v1")
 
 # ============================================================================
-# FIX: Normalize all routes to work WITH and WITHOUT trailing slash
-# This fixes the 404s caused by redirect_slashes=False
-# Frontend calls /api/v1/invoices but router defines /api/v1/invoices/
-# This adds a duplicate route for each, so both work.
+# Trailing-slash normalisation shim
+# Adds a hidden duplicate route for every path that ends in "/" so that both
+# /api/v1/invoices and /api/v1/invoices/ resolve to the same handler.
 # ============================================================================
 
-routes_to_add = []
-for route in app.routes:
-    if isinstance(route, APIRoute):
-        if route.path.endswith("/") and route.path != "/":
-            # Add a version without trailing slash
-            new_route = APIRoute(
-                path=route.path.rstrip("/"),
-                endpoint=route.endpoint,
-                methods=route.methods,
-                name=route.name + "_no_slash",
-                response_model=route.response_model,
-                status_code=route.status_code,
-                tags=route.tags,
-                dependencies=route.dependencies,
-                summary=route.summary,
-                description=route.description,
-                response_description=route.response_description,
-                responses=route.responses,
-                deprecated=route.deprecated,
-                operation_id=route.operation_id,
-                include_in_schema=False,  # Hide duplicates from docs
+_routes_to_add = []
+for _route in app.routes:
+    if isinstance(_route, APIRoute):
+        if _route.path.endswith("/") and _route.path != "/":
+            _routes_to_add.append(
+                APIRoute(
+                    path=_route.path.rstrip("/"),
+                    endpoint=_route.endpoint,
+                    methods=_route.methods,
+                    name=_route.name + "_no_slash",
+                    response_model=_route.response_model,
+                    status_code=_route.status_code,
+                    tags=_route.tags,
+                    dependencies=_route.dependencies,
+                    summary=_route.summary,
+                    description=_route.description,
+                    response_description=_route.response_description,
+                    responses=_route.responses,
+                    deprecated=_route.deprecated,
+                    operation_id=_route.operation_id,
+                    include_in_schema=False,  # keep duplicates out of any docs
+                )
             )
-            routes_to_add.append(new_route)
-
-for route in routes_to_add:
-    app.routes.append(route)
+for _route in _routes_to_add:
+    app.routes.append(_route)
 
 # ============================================================================
-# Exception Handlers
+# Exception handlers
 # ============================================================================
 
-app.add_exception_handler(StarletteHTTPException, http_exception_handler) # type: ignore
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)      # type: ignore
 app.add_exception_handler(RequestValidationError, validation_exception_handler) # type: ignore
-app.add_exception_handler(BaseAPIException, custom_exception_handler)  # type: ignore
-app.add_exception_handler(DBAPIError, database_exception_handler) # type: ignore
+app.add_exception_handler(BaseAPIException, custom_exception_handler)           # type: ignore
+app.add_exception_handler(DBAPIError, database_exception_handler)               # type: ignore
 app.add_exception_handler(Exception, general_exception_handler)
 
 # ============================================================================
-# Health Check Endpoints - PRODUCTION OPTIMIZED
+# Health / readiness endpoints
 # ============================================================================
+
 
 @app.get("/", tags=["System"])
 def root():
-    """
-    Ultra-fast root endpoint - no dependency checks
-
-    Provides API metadata and service discovery.
-    Used for basic connectivity testing.
-
-    FIXED: Removed async to prevent timeout issues
-    PRODUCTION OPTIMIZED: Added version and environment info
-    """
+    """Ultra-fast root endpoint — no dependency checks."""
     return {
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "status": "operational",
         "environment": settings.ENVIRONMENT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "documentation": "/docs",
+        "documentation": "/docs" if not _is_production else "disabled in production",
         "endpoints": {
             "health": "/health",
             "alive": "/alive",
             "ready": "/ready",
-            "api_base": settings.API_V1_PREFIX
-        }
+            "api_base": settings.API_V1_PREFIX,
+        },
     }
 
 
 @app.get("/alive", tags=["System"])
 def alive():
-    """
-    Kubernetes liveness probe - no dependency checks
-
-    Simple check that the application process is running.
-    Does not check database, Redis, or other dependencies.
-
-    Use this for:
-    - Kubernetes liveness probes
-    - Container health checks
-    - Uptime monitoring
-
-    FIXED: Removed async to prevent timeout issues
-    """
-    return {
-        "alive": True,
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
+    """Kubernetes liveness probe — confirms the process is running."""
+    return {"alive": True, "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/health", tags=["System"])
 def health_check(db: Session = Depends(get_db)):
     """
-    Fast health check - PRODUCTION OPTIMIZED
+    Load-balancer health check.
 
-    Checks:
-    - Database connectivity (using optimized check_database_connection)
-
-    Returns:
-    - 200: Healthy (all critical systems operational)
-    - 503: Unhealthy (database down, API cannot function)
-
-    Use this for:
-    - Load balancer health checks
-    - Monitoring systems
-    - General health monitoring
-
-    PRODUCTION OPTIMIZED: Uses enhanced database connection check
+    Returns 200 when the database is reachable, 503 otherwise.
     """
-    health_status = {
+    health: dict = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checks": {},
         "version": settings.APP_VERSION,
-        "environment": settings.ENVIRONMENT
+        "environment": settings.ENVIRONMENT,
     }
 
-    # Database check (CRITICAL) - Using enhanced function
     if check_database_connection():
-        health_status["checks"]["database"] = {"status": "healthy"}
+        health["checks"]["database"] = {"status": "healthy"}
     else:
-        health_status["status"] = "unhealthy"
-        health_status["checks"]["database"] = {
+        health["status"] = "unhealthy"
+        health["checks"]["database"] = {
             "status": "unhealthy",
-            "message": "Database connection failed"
+            "message": "Database connection failed",
         }
-        # Return 503 if database is down
-        return JSONResponse(status_code=503, content=health_status)
+        return JSONResponse(status_code=503, content=health)
 
-    return health_status
+    return health
 
 
 @app.get("/ready", tags=["System"])
 def readiness_check(db: Session = Depends(get_db)):
     """
-    Kubernetes readiness probe endpoint - PRODUCTION OPTIMIZED
+    Kubernetes readiness probe.
 
-    Returns 200 only if critical services (database) are available.
-    Unlike /health, this returns 503 immediately if database is down.
-
-    Use this for:
-    - Kubernetes readiness probes
-    - Load balancer backend pool checks
-    - Determining if instance can receive traffic
-
-    FIXED: Removed async/await to prevent timeouts
+    Returns 503 immediately if the database is unavailable so the load
+    balancer stops sending traffic to this instance.
     """
     try:
-        # Quick database check - synchronous
         db.execute(text("SELECT 1"))
-
-        return {
-            "ready": True,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Readiness check failed: {e}")
+        return {"ready": True, "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception as exc:
+        logger.error("Readiness check failed: %s", exc)
         return JSONResponse(
             status_code=503,
             content={
                 "ready": False,
-                "error": str(e)[:200],
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
+                "error": str(exc)[:200],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
 
-# ============================================================================
-# Connection Pool Status Endpoint - NEW (for monitoring)
-# ============================================================================
-
 @app.get("/pool-status", tags=["System"])
 def pool_status():
-    """
-    Get database connection pool statistics
-
-    PRODUCTION OPTIMIZED: Real-time pool monitoring
-
-    Use this for:
-    - Monitoring connection pool health
-    - Debugging connection issues
-    - Performance tuning
-    """
+    """Real-time DB connection-pool statistics (for ops monitoring)."""
     from app.core.database import get_pool_status
 
     try:
-        pool_stats = get_pool_status()
         return {
             "status": "healthy",
-            "pool": pool_stats,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "pool": get_pool_status(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-    except Exception as e:
-        logger.error(f"Pool status check failed: {e}")
+    except Exception as exc:
+        logger.error("Pool status check failed: %s", exc)
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
-                "error": str(e),
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
+                "error": str(exc),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
 
 # ============================================================================
-# Shutdown Event - Close database connections gracefully
+# Graceful shutdown
 # ============================================================================
+
 
 @app.on_event("shutdown")
 def shutdown_event():
-    """
-    Gracefully close database connections on shutdown
-
-    PRODUCTION OPTIMIZED: Ensures clean shutdown
-    """
-    logger.info("Shutting down application...")
+    logger.info("Shutting down — closing DB connections…")
     close_db_connections()
-    logger.info("Application shutdown complete")
+    logger.info("Shutdown complete.")

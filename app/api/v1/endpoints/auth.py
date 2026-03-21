@@ -9,6 +9,7 @@ PRODUCTION OPTIMIZED: Enhanced rate limiting and monitoring
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Request # type: ignore
 from sqlalchemy.orm import Session # type: ignore
+from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 import secrets
 import time
@@ -21,6 +22,7 @@ from app.core.security import (
     get_password_hash, 
     create_access_token
 )
+from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.user import (
     UserRegister,
@@ -56,7 +58,7 @@ def check_account_locked(user: User):
     Raises:
         HTTPException: If account is locked
     """
-    if user.locked_until and datetime.now(timezone.utc) < user.locked_until:
+    if user.locked_until and datetime.now(timezone.utc) < user.locked_until: # type: ignore
         remaining_minutes = (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60
         
         raise HTTPException(
@@ -81,11 +83,11 @@ def increment_failed_login(db: Session, user: User):
     Raises:
         HTTPException: If account is locked after incrementing
     """
-    user.failed_login_attempts += 1
+    user.failed_login_attempts += 1 # type: ignore
     
     # Lock account after 5 failed attempts for 30 minutes
-    if user.failed_login_attempts >= 5:
-        user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=30)
+    if user.failed_login_attempts >= 5: # type: ignore
+        user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=30) # type: ignore
         db.commit()
         
         # Log security event
@@ -125,9 +127,9 @@ def increment_failed_login(db: Session, user: User):
 
 def reset_failed_login(db: Session, user: User):
     """Reset failed login attempts on successful login"""
-    user.failed_login_attempts = 0
-    user.locked_until = None
-    user.last_login = datetime.now(timezone.utc)
+    user.failed_login_attempts = 0 # type: ignore
+    user.locked_until = None # type: ignore
+    user.last_login = datetime.now(timezone.utc) # type: ignore
     db.commit()
 
 
@@ -262,14 +264,14 @@ async def login(
         check_account_locked(user)
         
         # Check if account is deactivated
-        if not user.is_active:
+        if not user.is_active: # type: ignore
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Account is deactivated. Please contact support."
             )
         
         # Verify password
-        if not verify_password(password, user.password_hash):
+        if not verify_password(password, user.password_hash): # type: ignore
             # Increment failed attempts
             increment_failed_login(db, user)
             
@@ -343,16 +345,16 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
             detail="Invalid verification token"
         )
     
-    if user.is_verified:
+    if user.is_verified: # type: ignore
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already verified"
         )
     
     # Mark as verified
-    user.is_verified = True
-    user.email_verified_at = datetime.now(timezone.utc)
-    user.verification_token = None
+    user.is_verified = True # type: ignore
+    user.email_verified_at = datetime.now(timezone.utc) # type: ignore
+    user.verification_token = None # type: ignore
     db.commit()
     
     logger.info(f"Email verified: {user.email}")
@@ -388,8 +390,8 @@ async def forgot_password(
     
     # Generate reset token
     reset_token = secrets.token_urlsafe(32)
-    user.reset_token = reset_token
-    user.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    user.reset_token = reset_token # type: ignore
+    user.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1) # type: ignore
     db.commit()
     
     # TODO: Send password reset email
@@ -424,18 +426,18 @@ async def reset_password(
         )
     
     # Check if token expired
-    if user.reset_token_expires_at < datetime.now(timezone.utc):
+    if user.reset_token_expires_at < datetime.now(timezone.utc): # type: ignore
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Reset token has expired"
         )
     
     # Update password
-    user.password_hash = get_password_hash(reset_data.new_password)
-    user.reset_token = None
-    user.reset_token_expires_at = None
-    user.failed_login_attempts = 0
-    user.locked_until = None
+    user.password_hash = get_password_hash(reset_data.new_password) # type: ignore
+    user.reset_token = None # type: ignore
+    user.reset_token_expires_at = None # type: ignore
+    user.failed_login_attempts = 0 # type: ignore
+    user.locked_until = None # type: ignore
     db.commit()
     
     logger.info(f"Password reset completed: {user.email}")
@@ -484,7 +486,7 @@ async def check_login_status(
         }
     
     # Check if locked
-    if user.locked_until and datetime.now(timezone.utc) < user.locked_until:
+    if user.locked_until and datetime.now(timezone.utc) < user.locked_until: # type: ignore
         remaining_minutes = (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60
         
         return {
@@ -498,6 +500,84 @@ async def check_login_status(
         "can_login": True,
         "message": "Ready to login"
     }
+
+
+# ============================================================================
+# Change Password (Authenticated)
+# ============================================================================
+
+class ChangePasswordRequest(BaseModel):
+    """Request body for POST /auth/change-password"""
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+def change_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Change the authenticated user's password.
+
+    Requires a valid JWT token (Bearer) in the Authorization header.
+
+    **Args:**
+    - **current_password**: The user's existing password
+    - **new_password**: The desired new password (min 8 chars)
+    - **confirm_password**: Must match new_password
+
+    **Security checks:**
+    - Verifies the current password before allowing change
+    - Enforces minimum length of 8 characters
+    - Rejects new password that matches current password
+    - Requires confirmation to match new password
+
+    **Status Codes:**
+    - 200: Password updated successfully
+    - 400: Validation error (wrong current password, mismatch, too short, same password)
+    - 401: Not authenticated
+    """
+    # 1. Verify current password against stored hash
+    if not verify_password(payload.current_password, current_user.password_hash):  # type: ignore
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect"
+        )
+
+    # 2. Enforce minimum length
+    if len(payload.new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 8 characters"
+        )
+
+    # 3. Confirmation must match
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New passwords do not match"
+        )
+
+    # 4. New password must differ from current
+    if verify_password(payload.new_password, current_user.password_hash):  # type: ignore
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password"
+        )
+
+    # 5. Hash and persist
+    current_user.password_hash = get_password_hash(payload.new_password)  # type: ignore
+    db.commit()
+
+    logger.info(
+        f"Password changed: {current_user.email}",
+        extra={"user_id": str(current_user.id), "event": "password_changed"}
+    )
+
+    return {"message": "Password updated successfully", "success": True}
 
 
 # ============================================================================
