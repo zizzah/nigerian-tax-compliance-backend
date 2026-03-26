@@ -76,8 +76,13 @@ from app.api.v1.endpoints import (
     reminders,
     targets,
     users,
+    insights,
+    nlp_invoice,
+    reconciliation,
 )
 from app.api.v1.endpoints.stock_movements import router as stock_router
+from app.api.v1.endpoints import tax_calendar
+
 
 # ============================================================================
 # Logging
@@ -256,6 +261,11 @@ app.include_router(paystack.router,   prefix=settings.API_V1_PREFIX)
 app.include_router(targets.router,    prefix=settings.API_V1_PREFIX)
 app.include_router(expenses.router,   prefix=settings.API_V1_PREFIX)
 app.include_router(stock_router,      prefix="/api/v1")
+app.include_router(insights.router,        prefix=settings.API_V1_PREFIX)
+app.include_router(nlp_invoice.router,     prefix=settings.API_V1_PREFIX)
+app.include_router(reconciliation.router,  prefix=settings.API_V1_PREFIX)
+app.include_router(tax_calendar.router,    prefix=settings.API_V1_PREFIX)
+
 
 # ============================================================================
 # Trailing-slash normalisation shim

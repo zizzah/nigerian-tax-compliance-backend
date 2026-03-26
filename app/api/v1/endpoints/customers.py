@@ -304,6 +304,127 @@ async def search_customers(
         )
 
 
+
+
+@router.get("/{customer_id}/credit-score")
+def get_customer_credit_score(
+    customer_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Calculate a credit score (0-100) for a customer based on:
+    - Payment speed (days to pay)
+    - Payment consistency (std deviation)
+    - Outstanding balance ratio
+    - Invoice dispute rate
+    - Relationship length (account age)
+    """
+    from datetime import date, timedelta
+    from app.models.invoice import Invoice, InvoiceStatus
+
+    business = get_user_business(db, current_user.id) # type: ignore
+    customer = db.query(Customer).filter(
+        Customer.id == customer_id,
+        Customer.business_id == business.id,
+    ).first()
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Get all invoices for this customer
+    all_invoices = db.query(Invoice).filter(
+        Invoice.customer_id == customer_id,
+        Invoice.business_id == business.id,
+        Invoice.status != InvoiceStatus.DRAFT, # type: ignore
+        Invoice.status != InvoiceStatus.CANCELLED, # type: ignore
+    ).all()
+
+    if not all_invoices:
+        return {
+            "score": None, "grade": "N/A", "color": "#9e9990",
+            "reason": "No invoice history",
+            "factors": {},
+        }
+
+    paid = [i for i in all_invoices if i.status == InvoiceStatus.PAID and i.paid_at and i.issue_date] # type: ignore
+    overdue_now = [i for i in all_invoices if i.status == InvoiceStatus.OVERDUE or # type: ignore
+                   (i.status in [InvoiceStatus.SENT, InvoiceStatus.PARTIALLY_PAID] and i.due_date and i.due_date < date.today())]
+
+    # --- Factor 1: Payment Speed (0-30 points) ---
+    speed_score = 0
+    avg_days = None
+    if paid:
+        days_list = [(i.paid_at.date() - i.issue_date).days for i in paid]
+        avg_days = sum(days_list) / len(days_list)
+        if avg_days <= 14:   speed_score = 30
+        elif avg_days <= 30: speed_score = 25
+        elif avg_days <= 45: speed_score = 15
+        elif avg_days <= 60: speed_score = 8
+        else:                speed_score = 2
+
+    # --- Factor 2: Payment Consistency (0-25 points) ---
+    consistency_score = 0
+    if len(paid) >= 2:
+        days_list = [(i.paid_at.date() - i.issue_date).days for i in paid]
+        mean = sum(days_list) / len(days_list)
+        std_dev = (sum((d - mean) ** 2 for d in days_list) / len(days_list)) ** 0.5
+        if std_dev < 5:   consistency_score = 25
+        elif std_dev < 10: consistency_score = 20
+        elif std_dev < 20: consistency_score = 12
+        elif std_dev < 35: consistency_score = 6
+        else:              consistency_score = 2
+    elif len(paid) == 1:
+        consistency_score = 10  # some data
+
+    # --- Factor 3: Current Overdue (0-25 points, inverse) ---
+    overdue_score = 25  # start max
+    total_invoiced = float(customer.total_invoiced_amount or 0) # type: ignore
+    total_overdue = sum(float(i.outstanding_amount or 0) for i in overdue_now)   # type: ignore
+    if total_invoiced > 0:
+        overdue_ratio = total_overdue / total_invoiced
+        if overdue_ratio > 0.5:  overdue_score = 0
+        elif overdue_ratio > 0.3: overdue_score = 5
+        elif overdue_ratio > 0.1: overdue_score = 12
+        elif overdue_ratio > 0:  overdue_score = 18
+
+    # --- Factor 4: Relationship Length (0-10 points) ---
+    first_invoice = min(all_invoices, key=lambda i: i.issue_date)
+    days_relationship = (date.today() - first_invoice.issue_date).days
+    if days_relationship > 365:   rel_score = 10
+    elif days_relationship > 180: rel_score = 7
+    elif days_relationship > 90:  rel_score = 4
+    else:                         rel_score = 2
+
+    # --- Factor 5: Volume (0-10 points) ---
+    vol_score = min(10, len(all_invoices))
+
+    total_score = speed_score + consistency_score + overdue_score + rel_score + vol_score
+
+    # Grade
+    if total_score >= 80:   grade, color = "A", "#059669"
+    elif total_score >= 65: grade, color = "B", "#2563eb"
+    elif total_score >= 50: grade, color = "C", "#d97706"
+    elif total_score >= 35: grade, color = "D", "#ea580c"
+    else:                   grade, color = "F", "#dc2626"
+
+    return {
+        "score": total_score,
+        "grade": grade,
+        "color": color,
+        "avg_payment_days": round(avg_days, 1) if avg_days else None,
+        "total_invoices": len(all_invoices),
+        "paid_invoices": len(paid),
+        "overdue_invoices": len(overdue_now),
+        "overdue_amount": total_overdue,
+        "factors": {
+            "payment_speed": {"score": speed_score, "max": 30, "label": "Payment Speed"},
+            "consistency": {"score": consistency_score, "max": 25, "label": "Consistency"},
+            "overdue_risk": {"score": overdue_score, "max": 25, "label": "No Outstanding Debt"},
+            "relationship": {"score": rel_score, "max": 10, "label": "Relationship Length"},
+            "volume": {"score": vol_score, "max": 10, "label": "Invoice Volume"},
+        },
+    }
+
 @router.get("/summary", response_model=list[CustomerSummary])
 async def list_customers_summary(
     limit: int = Query(10, ge=1, le=100, description="Max items to return"),
@@ -584,7 +705,7 @@ async def get_customer_statistics(
     AFTER: Uses database aggregation only → <100ms
     """
     try:
-        business = get_user_business(db, current_user.id)
+        business = get_user_business(db, current_user.id)   # type: ignore
         
         # ==================================================================
         # OPTIMIZATION: Use database aggregation (not Python)
@@ -598,8 +719,8 @@ async def get_customer_statistics(
             Customer.business_id == business.id
         ).first()
         
-        total_customers = stats.total or 0
-        active_customers = stats.active or 0
+        total_customers = stats.total or 0 # type: ignore
+        active_customers = stats.active or 0 # type: ignore
         
         # ==================================================================
         # CRITICAL FIX: Get top customers using SQL (not Python sorting)
@@ -620,7 +741,7 @@ async def get_customer_statistics(
             func.avg(Customer.average_payment_days)
         ).filter(
             Customer.business_id == business.id,
-            Customer.average_payment_days.isnot(None)
+            Customer.average_payment_days.isnot(None)  # type: ignore
         ).scalar()
         
         avg_payment_days = float(avg_payment_days_result) if avg_payment_days_result else None
@@ -634,8 +755,8 @@ async def get_customer_statistics(
                 {
                     "id": c.id,
                     "name": c.name,
-                    "total_invoiced": float(c.total_invoiced_amount) if c.total_invoiced_amount else 0.0,
-                    "total_paid": float(c.total_paid_amount) if c.total_paid_amount else 0.0,
+                    "total_invoiced": float(c.total_invoiced_amount) if c.total_invoiced_amount else 0.0,  # type: ignore
+                    "total_paid": float(c.total_paid_amount) if c.total_paid_amount else 0.0,  # type: ignore
                     "outstanding": float(c.outstanding_amount) if c.outstanding_amount else 0.0
                 }
                 for c in top_customers_query

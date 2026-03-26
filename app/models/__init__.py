@@ -39,6 +39,10 @@ from app.models.reminder import ReminderRule, ReminderLog
 # Sales targets
 from app.models.sales_target import SalesTarget, split_annual_target
 
+# AI Insights  ← NEW
+from app.models.ai_insight import AIInsight
+from app.models.bank_reconciliation import BankReconciliation
+
 
 __all__ = [
     "Base",
@@ -69,4 +73,7 @@ __all__ = [
     # Targets
     "SalesTarget",
     "split_annual_target",
+    # AI
+    "AIInsight",
+    "BankReconciliation",
 ]
