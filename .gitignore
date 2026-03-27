@@ -188,7 +188,6 @@ generated_pdfs/
 *.pdf
 
 # AI Model files (if downloaded locally)
-models/
 *.bin
 *.h5
 *.onnx

@@ -5,6 +5,8 @@ Location: app/api/v1/endpoints/documents.py
 Files are stored in Cloudinary (not local disk) so they persist
 across Render deploys and work correctly in production.
 """
+import math
+
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -87,7 +89,8 @@ def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str) -> 
         public_id=unique_name,
         resource_type="auto",   # handles images + PDFs
         overwrite=False,
-        folder="taxflow_documents",
+        access_mode="public",
+        type="upload",
     )
     return result
 
@@ -443,7 +446,18 @@ async def list_documents(
     total     = query.count()
     documents = query.order_by(Document.created_at.desc()).offset(skip).limit(limit).all()
 
-    return {"documents": documents, "total": total, "skip": skip, "limit": limit}
+    return {  
+        "total": total,
+        "documents": documents,
+        "skip": skip,
+        "limit": limit,
+        "has_more": skip + limit < total,
+        "page": (skip // limit) + 1 if limit > 0 else 1,
+        "page_size": len(documents),
+        "total_page": math.ceil(total / limit) if limit > 0 else 0,  
+
+
+    }
 
 
 # ── PATCH /documents/{id} ─────────────────────────────────────────────────────
