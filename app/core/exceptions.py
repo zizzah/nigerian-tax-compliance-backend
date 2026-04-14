@@ -248,46 +248,22 @@ async def custom_exception_handler(request: Request, exc: BaseAPIException):
 
 
 async def general_exception_handler(request: Request, exc: Exception):
-    """
-    Handle unexpected exceptions
-    
-    Logs full traceback but returns sanitized error to user
-    """
-    # Get traceback
     exc_type, exc_value, exc_traceback = sys.exc_info()
-    tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    tb_str = ''.join(traceback.format_exception(...)) # type: ignore
     
-    # Log full error with traceback
     logger.error(
-        f"Unhandled exception on {request.method} {request.url.path}: {str(exc)}",
-        extra={
-            "error_type": type(exc).__name__,
-            "error_message": str(exc),
-            "traceback": tb_str,
-            "path": str(request.url.path),
-            "method": request.method,
-            "request_id": getattr(request.state, "request_id", None)
-        },
-        exc_info=True
+        f"Unhandled exception: {str(exc)}",
+        extra={"traceback": tb_str}  # ✅ logged server side
     )
     
-    # Return sanitized error (don't expose internal details)
     return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        status_code=500,
         content={
             "error": {
-                "type": "internal_error",
-                "code": 500,
-                "message": "An unexpected error occurred. Please try again later.",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "path": str(request.url.path),
-                "method": request.method,
-                "request_id": getattr(request.state, "request_id", None)
+                "message": "An unexpected error occurred."  # ✅ sanitized for user
             }
         }
     )
-
-
 # ============================================================================
 # DATABASE ERROR HANDLING
 # ============================================================================

@@ -20,6 +20,16 @@ class InputSanitizer:
     # Allowed HTML tags (empty = strip all)
     ALLOWED_TAGS = []
     ALLOWED_ATTRIBUTES = {}
+    DANGEROUS_PATTERN = re.compile(
+        r'<(script|style|iframe|object|embed|svg|math|form|input|textarea|select|button)'
+        r'[^>]*>.*?</\1>|<(script|style|iframe|object|embed|svg|math|form|input|textarea'
+        r'|select|button)[^>]*/?>',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    EVENT_PATTERN = re.compile(r'\s*on\w+\s*=\s*["\']?[^"\'>\s]+["\']?', re.IGNORECASE)
+    JAVASCRIPT_PATTERN = re.compile(r'javascript:', re.IGNORECASE)
+
     
     @staticmethod
     def sanitize_text(text: Optional[str], field_type: str = "general", max_length: int = 10000) -> Optional[str]:
@@ -36,11 +46,33 @@ class InputSanitizer:
             
         SECURITY FIX: Now removes dangerous tags AND their content
         """
+
+        
+
         if not text:
             return text
-        
-        # Convert to string
+    
         text = str(text)
+        
+        text = InputSanitizer.DANGEROUS_PATTERN.sub('', text)
+         # Remove event handlers (onclick, onerror, etc.)
+        
+        text = InputSanitizer.EVENT_PATTERN.sub('', text)
+
+        # Remove javascript: protocol
+        text = InputSanitizer.JAVASCRIPT_PATTERN.sub('', text)
+        
+        
+
+        text = bleach.clean(
+            text, # type: ignore
+            tags=InputSanitizer.ALLOWED_TAGS,
+            attributes=InputSanitizer.ALLOWED_ATTRIBUTES,
+            strip=True
+        )
+        
+    
+        
         
         # Adjust max_length based on field type (field_type takes precedence)
         if field_type == "name":
@@ -56,28 +88,7 @@ class InputSanitizer:
         if len(text) > max_length:
             text = text[:max_length]
         
-        # ========================================================================
-        # SECURITY FIX: Remove dangerous tags AND their content
-        # ========================================================================
-        # This regex removes entire script/style/iframe/object/embed tags with content
-        # Matches both <tag>content</tag> and self-closing <tag/>
-        dangerous_pattern = r'<(script|style|iframe|object|embed|svg|math|form|input|textarea|select|button)[^>]*>.*?</\1>|<(script|style|iframe|object|embed|svg|math|form|input|textarea|select|button)[^>]*/?>'
-        text = re.sub(dangerous_pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
-        
-        # Remove event handlers (onclick, onerror, etc.)
-        event_pattern = r'\s*on\w+\s*=\s*["\']?[^"\'>\s]+["\']?'
-        text = re.sub(event_pattern, '', text, flags=re.IGNORECASE)
-        
-        # Remove javascript: protocol
-        text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
-        
-        # Then strip remaining HTML tags (keeping their text content for harmless tags)
-        text = bleach.clean(
-            text,
-            tags=InputSanitizer.ALLOWED_TAGS,
-            attributes=InputSanitizer.ALLOWED_ATTRIBUTES,
-            strip=True
-        )
+       
         
         # Remove null bytes
         text = text.replace('\x00', '')

@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     TEST_DATABASE_URL: Optional[str] = None
     
     # Database Pool Settings (for enhanced database.py)
-    DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
+    DB_POOL_SIZE: int = 20  # pydantic reads DB_POOL_SIZE from env automatically
     DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "30"))
     DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
     DB_POOL_RECYCLE: int = int(os.getenv("DB_POOL_RECYCLE", "3600"))
