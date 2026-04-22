@@ -1,0 +1,24 @@
+# ===============================
+# DEVELOPMENT & SECURITY SCANNING
+# ===============================
+# These packages are typically used in development/CI pipelines
+# Install with: pip install -r requirements-dev.txt
+
+# Security scanning
+bandit==1.8.0  # Python security linting
+safety==3.3.1  # Dependency vulnerability scanning
+
+# Code quality
+black==24.10.0  # Code formatter
+flake8==7.1.1  # Linting
+mypy==1.14.0  # Type checking
+isort==5.13.2  # Import sorting
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+httpx==0.26.0  # For testing FastAPI endpoints
+
+# Documentation
+sphinx==8.1.3
