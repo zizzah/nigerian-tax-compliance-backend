@@ -8,12 +8,15 @@ WITH SECURITY FIXES: Rate limiting on authentication endpoints
 PRODUCTION OPTIMIZED: Enhanced rate limiting and monitoring
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Request # type: ignore
-from sqlalchemy.orm import Session # type: ignore
+import asyncio
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select
+
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 import secrets
-import time
 import logging
+from typing import Optional
 
 from app.core.database import get_db
 from app.core.rate_limit import limiter
@@ -43,12 +46,14 @@ logger = logging.getLogger(__name__)
 # Helper Functions
 # ============================================================================
 
-def get_user_by_email(db: Session, email: str) -> User:
+async def get_user_by_email(db: AsyncSession, email: str) -> User:
     """Get user by email"""
-    return db.query(User).filter(User.email == email).first()
+    result = await db.execute(select(User).where(User.email == email))        
+    return result.scalar_one_or_none() # type: ignore
+    
 
 
-def check_account_locked(user: User):
+async def check_account_locked(user: User):
     """
     Check if user account is locked
     
@@ -72,7 +77,7 @@ def check_account_locked(user: User):
         )
 
 
-def increment_failed_login(db: Session, user: User):
+async def increment_failed_login(db: AsyncSession, user: User):
     """
     Increment failed login attempts and lock if needed
     
@@ -88,11 +93,13 @@ def increment_failed_login(db: Session, user: User):
     # Lock account after 5 failed attempts for 30 minutes
     if user.failed_login_attempts >= 5: # type: ignore
         user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=30) # type: ignore
-        db.commit()
+        await db.commit()
         
         # Log security event
         logger.warning(
-            f"Account locked due to failed login attempts: {user.email}",
+            "Account locked due to failed login attempts %s: %s",
+            user.id,
+            user.email,
             extra={
                 "user_id": str(user.id),
                 "email": user.email,
@@ -111,11 +118,11 @@ def increment_failed_login(db: Session, user: User):
             }
         )
     
-    db.commit()
+    await db.commit()
     
     # Log failed attempt
     logger.warning(
-        f"Failed login attempt {user.failed_login_attempts}/5: {user.email}",
+        "Failed login attempt %s", user.email,
         extra={
             "user_id": str(user.id),
             "email": user.email,
@@ -125,12 +132,12 @@ def increment_failed_login(db: Session, user: User):
     )
 
 
-def reset_failed_login(db: Session, user: User):
+async def reset_failed_login(db: AsyncSession, user: User):
     """Reset failed login attempts on successful login"""
     user.failed_login_attempts = 0 # type: ignore
     user.locked_until = None # type: ignore
     user.last_login = datetime.now(timezone.utc) # type: ignore
-    db.commit()
+    await db.commit()
 
 
 # ============================================================================
@@ -143,7 +150,7 @@ def reset_failed_login(db: Session, user: User):
 async def register(
     request: Request,  # REQUIRED: For rate limiting
     user_data: UserRegister, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Register a new user
@@ -164,7 +171,7 @@ async def register(
     """
     try:
         # Check if user already exists
-        existing_user = get_user_by_email(db, user_data.email)
+        existing_user = await get_user_by_email(db, user_data.email)
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -182,21 +189,22 @@ async def register(
         )
         
         db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
+        await db.commit()
+        await db.refresh(new_user)
         
         # TODO: Send verification email
         # send_verification_email(new_user.email, new_user.verification_token)
         
-        logger.info(f"New user registered: {new_user.email}")
+        logger.info("New user registered: %s", new_user.email)
+
         
         return new_user
         
     except HTTPException:
         raise
     except Exception as e:
-        db.rollback()
-        logger.error(f"Registration error: {e}", exc_info=True)
+        await db.rollback()
+        logger.error("Registration error: %s", e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error creating user account"
@@ -208,7 +216,7 @@ async def register(
 async def login(
     request: Request,  # REQUIRED: For rate limiting
     credentials: UserLogin, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Login with email and password - PRODUCTION OPTIMIZED
@@ -247,12 +255,12 @@ async def login(
         password = credentials.password
         
         # Get user
-        user = get_user_by_email(db, email)
+        user = await get_user_by_email(db, email)
         
         # SECURITY: Don't reveal whether email exists
         if not user:
             # Add small delay to prevent timing attacks
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -261,7 +269,7 @@ async def login(
             )
         
         # Check if account is locked
-        check_account_locked(user)
+        await check_account_locked(user)
         
         # Check if account is deactivated
         if not user.is_active: # type: ignore
@@ -273,10 +281,10 @@ async def login(
         # Verify password
         if not verify_password(password, user.password_hash): # type: ignore
             # Increment failed attempts
-            increment_failed_login(db, user)
+            await increment_failed_login(db, user)
             
             # Add delay to prevent brute force
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
             
             # Return generic error (don't reveal which field is wrong)
             raise HTTPException(
@@ -286,7 +294,7 @@ async def login(
             )
         
         # SUCCESS - Reset counters & create token
-        reset_failed_login(db, user)
+        await reset_failed_login(db, user)
         
         # Create access token with claims
         access_token = create_access_token(
@@ -299,7 +307,7 @@ async def login(
         
         # Log successful login (for security audit)
         logger.info(
-            f"Successful login: {user.email}",
+            "Successful login %s", user.email,
             extra={
                 "user_id": str(user.id),
                 "email": user.email,
@@ -319,7 +327,7 @@ async def login(
     
     except Exception as e:
         # Log unexpected errors
-        logger.error(f"Login error: {e}", exc_info=True)
+        logger.error("Login error %s ",e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An error occurred during login. Please try again."
@@ -327,7 +335,7 @@ async def login(
 
 
 @router.post("/verify-email", response_model=MessageResponse)
-async def verify_email(token: str, db: Session = Depends(get_db)):
+async def verify_email(token: str, db: AsyncSession = Depends(get_db)):
     """
     Verify email address with token sent via email
     
@@ -337,7 +345,8 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
     **Returns:**
     - Success message
     """
-    user = db.query(User).filter(User.verification_token == token).first()
+    result = await db.execute(select(User).where(User.verification_token == token))
+    user = result.scalar_one_or_none()
     
     if not user:
         raise HTTPException(
@@ -355,9 +364,9 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
     user.is_verified = True # type: ignore
     user.email_verified_at = datetime.now(timezone.utc) # type: ignore
     user.verification_token = None # type: ignore
-    db.commit()
+    await db.commit()
     
-    logger.info(f"Email verified: {user.email}")
+    logger.info("Email verified %s", user.email)
     
     return {
         "message": "Email verified successfully",
@@ -370,7 +379,7 @@ async def verify_email(token: str, db: Session = Depends(get_db)):
 async def forgot_password(
     request: Request,  # REQUIRED: For rate limiting
     reset_request: PasswordResetRequest, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Request password reset - sends reset token to email
@@ -379,7 +388,7 @@ async def forgot_password(
     
     **Security:** Always returns success (doesn't reveal if email exists)
     """
-    user = get_user_by_email(db, reset_request.email)
+    user = await get_user_by_email(db, reset_request.email)
     
     if not user:
         # Don't reveal if email exists - security best practice
@@ -392,12 +401,12 @@ async def forgot_password(
     reset_token = secrets.token_urlsafe(32)
     user.reset_token = reset_token # type: ignore
     user.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1) # type: ignore
-    db.commit()
+    await db.commit()
     
     # TODO: Send password reset email
     # send_password_reset_email(user.email, reset_token)
     
-    logger.info(f"Password reset requested: {user.email}")
+    logger.info("Password reset requested %s", user.email)
     
     return {
         "message": "If the email exists, a password reset link has been sent",
@@ -410,14 +419,15 @@ async def forgot_password(
 async def reset_password(
     request: Request,  # REQUIRED: For rate limiting
     reset_data: PasswordReset, 
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Reset password using token from email
     
     **Rate Limiting:** 5 requests per hour per IP
     """
-    user = db.query(User).filter(User.reset_token == reset_data.token).first()
+    result = await db.execute(select(User).where(User.reset_token == reset_data.token))
+    user = result.scalar_one_or_none()
     
     if not user:
         raise HTTPException(
@@ -438,9 +448,9 @@ async def reset_password(
     user.reset_token_expires_at = None # type: ignore
     user.failed_login_attempts = 0 # type: ignore
     user.locked_until = None # type: ignore
-    db.commit()
+    await db.commit()
     
-    logger.info(f"Password reset completed: {user.email}")
+    logger.info("Password reset completed %s", user.email)
     
     return {
         "message": "Password reset successfully",
@@ -462,44 +472,6 @@ async def logout():
     }
 
 
-@router.get("/login-status")
-async def check_login_status(
-    email: str,
-    db: Session = Depends(get_db)
-):
-    """
-    Check if email is locked (useful for frontend)
-    
-    **Args:**
-    - **email**: Email to check
-    
-    **Returns:**
-    - Status information (without revealing if email exists)
-    """
-    user = get_user_by_email(db, email)
-    
-    # Don't reveal if email exists
-    if not user:
-        return {
-            "can_login": True,
-            "message": "Ready to login"
-        }
-    
-    # Check if locked
-    if user.locked_until and datetime.now(timezone.utc) < user.locked_until: # type: ignore
-        remaining_minutes = (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60
-        
-        return {
-            "can_login": False,
-            "locked": True,
-            "retry_after_minutes": int(remaining_minutes) + 1,
-            "message": f"Account locked. Try again in {int(remaining_minutes) + 1} minutes."
-        }
-    
-    return {
-        "can_login": True,
-        "message": "Ready to login"
-    }
 
 
 # ============================================================================
@@ -514,10 +486,10 @@ class ChangePasswordRequest(BaseModel):
 
 
 @router.post("/change-password", status_code=status.HTTP_200_OK)
-def change_password(
+async def change_password(
     payload: ChangePasswordRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Change the authenticated user's password.
@@ -570,10 +542,10 @@ def change_password(
 
     # 5. Hash and persist
     current_user.password_hash = get_password_hash(payload.new_password)  # type: ignore
-    db.commit()
+    await db.commit()
 
     logger.info(
-        f"Password changed: {current_user.email}",
+        "Password changed %s", current_user.email,
         extra={"user_id": str(current_user.id), "event": "password_changed"}
     )
 
