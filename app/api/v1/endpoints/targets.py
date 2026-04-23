@@ -11,12 +11,13 @@ Endpoints:
 """
 import uuid
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select
 from sqlalchemy import extract, func
 from pydantic import BaseModel, Field
 
@@ -41,38 +42,40 @@ MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.user_id == user.id).first()
+async def _get_business(db: AsyncSession, user: User) -> Business:
+    result = await db.execute(select(Business).filter(Business.user_id == user.id))
+    biz = result.scalar_one_or_none()
     if not biz:
         raise HTTPException(status_code=404, detail="Business profile not found")
     return biz
 
 
-def _get_monthly_actuals(db: Session, business_id: uuid.UUID, year: int) -> list[float]:
+async def _get_monthly_actuals(db: AsyncSession, business_id: uuid.UUID, year: int) -> list[float]:
     """Return list of 12 floats — actual revenue collected per month via payments."""
-    rows = (
-        db.query(
-            extract('month', Payment.payment_date).label('month'),
+    result = (
+        await db.execute(
+            select(extract('month', Payment.payment_date).label('month'),
             func.sum(Payment.amount).label('total'),
         )
-        .filter(
+        .where(
             Payment.business_id == business_id,
             extract('year', Payment.payment_date) == year,
         )
-        .group_by('month')
-        .all()
+        .group_by('month'))
+        
     )
+    rows= result.all()
     actuals = [0.0] * 12
     for row in rows:
         actuals[int(row.month) - 1] = float(row.total or 0)
     return actuals
 
 
-def _get_pipeline(db: Session, business_id: uuid.UUID, year: int) -> float:
+async def _get_pipeline(db: AsyncSession, business_id: uuid.UUID, year: int) -> float:
     """Outstanding amount on SENT/OVERDUE/PARTIALLY_PAID invoices for the year."""
-    result = (
-        db.query(func.sum(Invoice.outstanding_amount))
-        .filter(
+    res = (
+        await db.execute(select(func.sum(Invoice.outstanding_amount))
+        .where(
             Invoice.business_id == business_id,
             extract('year', Invoice.issue_date) == year,
             Invoice.status.in_([ # type: ignore
@@ -80,29 +83,31 @@ def _get_pipeline(db: Session, business_id: uuid.UUID, year: int) -> float:
                 InvoiceStatus.OVERDUE,
                 InvoiceStatus.PARTIALLY_PAID,
             ]),
-        )
-        .scalar()
+        ))
+        
     )
+    result = res.scalar()
     return float(result or 0)
 
 
-def _get_top_customers(db: Session, business_id: uuid.UUID, year: int, limit: int = 5):
+async def _get_top_customers(db: AsyncSession, business_id: uuid.UUID, year: int, limit: int = 5):
     """Top customers by revenue collected this year."""
-    rows = (
-        db.query(
-            Customer.name,
+    ro = (
+        await db.execute(
+            select(Customer.name,
             func.sum(Payment.amount).label('total'),
         )
         .join(Payment, Payment.customer_id == Customer.id)
-        .filter(
+        .where(
             Payment.business_id == business_id,
             extract('year', Payment.payment_date) == year,
         )
         .group_by(Customer.id, Customer.name)
         .order_by(func.sum(Payment.amount).desc())
-        .limit(limit)
-        .all()
+        .limit(limit))
+        
     )
+    rows = ro.all()
     return [{"name": r.name, "amount": float(r.total)} for r in rows]
 
 
@@ -210,30 +215,31 @@ class TargetCreate(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/")
-def list_targets(
-    db: Session = Depends(get_db),
+async def list_targets(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """List all targets for this business."""
-    biz = _get_business(db, current_user)
-    targets = (
-        db.query(SalesTarget)
-        .filter(SalesTarget.business_id == biz.id)
-        .order_by(SalesTarget.year.desc())
-        .all()
+    biz = await _get_business(db, current_user)
+    target = (
+        await db.execute(select(SalesTarget)
+        .where(SalesTarget.business_id == biz.id)
+        .order_by(SalesTarget.year.desc()))
+        
     )
+    targets = target.scalars().all()
     return [{"id": str(t.id), "year": t.year,
              "annual_target": float(t.annual_target)} for t in targets] # type: ignore
 
 
 @router.post("/", status_code=201)
-def create_or_update_target(
+async def create_or_update_target(
     data: TargetCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Create a new target or update existing one for the year."""
-    biz = _get_business(db, current_user)
+    biz = await  _get_business(db, current_user)
 
     # Auto-split unless overrides provided
     splits = split_annual_target(data.annual_target)
@@ -250,10 +256,12 @@ def create_or_update_target(
     splits['q3_target'] = round(splits['jul'] + splits['aug'] + splits['sep'], 2)
     splits['q4_target'] = round(splits['oct'] + splits['nov'] + splits['dec'], 2)
 
-    existing = db.query(SalesTarget).filter(
+    existings =await db.execute(select(SalesTarget).where(
         SalesTarget.business_id == biz.id,
         SalesTarget.year == data.year,
-    ).first()
+    ))
+
+    existing =existings.scalar_one_or_none()
 
     if existing:
         existing.annual_target = data.annual_target  # type: ignore
@@ -261,9 +269,9 @@ def create_or_update_target(
             setattr(existing, f"{key}_target", splits[key])
         for q in ['q1_target', 'q2_target', 'q3_target', 'q4_target']:
             setattr(existing, q, splits[q])
-        existing.updated_at = datetime.utcnow()  # type: ignore
-        db.commit()
-        db.refresh(existing)
+        existing.updated_at = datetime.now(timezone.utc)  # type: ignore
+        await db.commit()
+        await db.refresh(existing)
         return {"message": f"{data.year} target updated", "id": str(existing.id),
                 "splits": splits}
     else:
@@ -279,33 +287,35 @@ def create_or_update_target(
             q4_target=splits['q4_target'],
         )
         db.add(target)
-        db.commit()
-        db.refresh(target)
+        await db.commit()
+        await db.refresh(target)
         return {"message": f"{data.year} target created", "id": str(target.id),
                 "splits": splits}
 
 
 @router.get("/{year}")
-def get_target_performance(
+async def get_target_performance(
     year: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get target + actual performance breakdown for a year."""
-    biz = _get_business(db, current_user)
+    biz =await  _get_business(db, current_user)
 
-    target = db.query(SalesTarget).filter(
+    tat =await  db.execute(select(SalesTarget).where(
         SalesTarget.business_id == biz.id,
         SalesTarget.year == year,
-    ).first()
+    ))
+
+    target =tat.scalar_one_or_none()
 
     if not target:
         raise HTTPException(status_code=404,
                             detail=f"No target set for {year}. Create one first.")
 
-    actuals  = _get_monthly_actuals(db, biz.id, year) # type: ignore
-    pipeline = _get_pipeline(db, biz.id, year) # type: ignore
-    top_customers = _get_top_customers(db, biz.id, year) # type: ignore
+    actuals  = await   _get_monthly_actuals(db, biz.id, year) # type: ignore
+    pipeline =await  _get_pipeline(db, biz.id, year) # type: ignore
+    top_customers= await  _get_top_customers(db, biz.id, year) # type: ignore
     perf = _build_performance(target, actuals, year)
     perf["pipeline"] = pipeline
     perf["top_customers"] = top_customers
@@ -314,27 +324,29 @@ def get_target_performance(
 
 
 @router.delete("/{year}", status_code=204)
-def delete_target(
+async def delete_target(
     year: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
-    target = db.query(SalesTarget).filter(
+    biz =await  _get_business(db, current_user)
+    tat =await  db.execute(select(SalesTarget).where(
         SalesTarget.business_id == biz.id,
         SalesTarget.year == year,
-    ).first()
+    ))
+
+    target =tat.scalar_one_or_none()
     if not target:
         raise HTTPException(status_code=404, detail="Target not found")
-    db.delete(target)
-    db.commit()
+    await db.delete(target)
+    await db.commit()
     return None
 
 
 @router.post("/{year}/ai-advice")
-def get_ai_advice(
+async def get_ai_advice(
     year: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
@@ -344,35 +356,37 @@ def get_ai_advice(
     - Seasonal patterns from past data
     - Invoice pipeline forecast
     """
-    biz = _get_business(db, current_user)
+    biz =await  _get_business(db, current_user)
 
-    target = db.query(SalesTarget).filter(
+    tat =await  db.execute(select(SalesTarget).where(
         SalesTarget.business_id == biz.id,
         SalesTarget.year == year,
-    ).first()
+    ))
+    target =tat.scalar_one_or_none()
     if not target:
         raise HTTPException(status_code=404, detail="No target set for this year.")
 
-    actuals       = _get_monthly_actuals(db, biz.id, year) # type: ignore
-    pipeline      = _get_pipeline(db, biz.id, year)  # type: ignore
-    top_customers = _get_top_customers(db, biz.id, year, limit=5)  # type: ignore
+    actuals       = await  _get_monthly_actuals(db, biz.id, year) # type: ignore
+    pipeline      =await  _get_pipeline(db, biz.id, year)  # type: ignore
+    top_customers = await _get_top_customers(db, biz.id, year, limit=5)  # type: ignore
     perf          = _build_performance(target, actuals, year)
 
     # Also get last year's actuals for seasonal context
-    prev_actuals = _get_monthly_actuals(db, biz.id, year - 1) # type: ignore
+    prev_actuals =await  _get_monthly_actuals(db, biz.id, year - 1) # type: ignore
     prev_total   = sum(prev_actuals)
 
     # Overdue invoice count
-    overdue_count = db.query(func.count(Invoice.id)).filter(
+    over = await db.execute(select(func.count(Invoice.id)).where(
         Invoice.business_id == biz.id,
         Invoice.status == InvoiceStatus.OVERDUE,  # type: ignore
-    ).scalar() or 0
+    ))
+    overdue_count =over.scalar_one_or_none() or 0
 
-    overdue_amount = db.query(func.sum(Invoice.outstanding_amount)).filter(
+    due = await db.execute(select(func.sum(Invoice.outstanding_amount)).where(
         Invoice.business_id == biz.id,
         Invoice.status == InvoiceStatus.OVERDUE,  # type: ignore
-    ).scalar() or 0
-
+    ))
+    overdue_amount= due.scalar()
     # Build context for Groq
     today = date.today()
     months_elapsed = max(perf['months_elapsed'], 1)
@@ -391,7 +405,7 @@ MONTHS ELAPSED: {months_elapsed} of 12 ({remaining_months} months left)
 CURRENT RUN RATE: ₦{perf['run_rate_monthly']:,.0f}/month
 PROJECTED YEAR-END: ₦{perf['projected']:,.0f}
 PIPELINE (unpaid invoices): ₦{pipeline:,.0f}
-OVERDUE INVOICES: {overdue_count} invoices worth ₦{float(overdue_amount):,.0f}
+OVERDUE INVOICES: {overdue_count} invoices worth ₦{float(overdue_amount or 0):,.0f} # type: ignore
 
 QUARTERLY PERFORMANCE:
 {chr(10).join(f"  Q{q['quarter']}: Target ₦{q['target']:,.0f} | Actual ₦{q['actual']:,.0f} | {q['pct']}% ({q['status'].upper()})" for q in perf['quarters'])}
@@ -432,7 +446,7 @@ Respond ONLY with the JSON. No markdown, no preamble."""
         raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         import json
         advice = json.loads(raw)
-        return {"advice": advice, "generated_at": datetime.utcnow().isoformat()}
+        return {"advice": advice, "generated_at": datetime.now(timezone.utc).isoformat()}
 
     except Exception as e:
         logger.error(f"Groq AI advice error: {e}")

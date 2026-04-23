@@ -8,7 +8,10 @@ name fuzzy matching.
 """
 import json
 import logging
-from sqlalchemy.orm import Session
+from typing import List, Dict
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from groq import Groq
 
 from app.core.config import settings
@@ -25,7 +28,7 @@ class BankReconciler:
 
     # ── Statement parsing ──────────────────────────────────────────────────────
 
-    def parse_statement_text(self, text: str, bank_name: str = "") -> list[dict]:
+    def parse_statement_text(self, text: str, bank_name: str = "") -> List[Dict]:
         """
         Extract credit transactions from raw bank statement text using Groq.
 
@@ -72,9 +75,9 @@ RULES:
 
     # ── Invoice matching ───────────────────────────────────────────────────────
 
-    def match_transactions(
-        self, transactions: list[dict], business_id: str, db: Session
-    ) -> list[dict]:
+    async def match_transactions(
+        self, transactions: List[Dict], business_id: str, db: AsyncSession
+    ) -> List[Dict]:
         """
         Match each credit transaction to the most likely outstanding invoice.
 
@@ -84,19 +87,22 @@ RULES:
         - Invoice number found in narration or reference (+30)
         Threshold: score ≥ 40 is considered a match.
         """
-        outstanding = (
-            db.query(Invoice, Customer.name.label("customer_name"))
+
+        stmt = (
+            select(Invoice, Customer.name.label("customer_name"))
             .join(Customer, Invoice.customer_id == Customer.id, isouter=True)
-            .filter(
+            .where(
                 Invoice.business_id == business_id,
-                Invoice.status.in_([ # type: ignore
+                Invoice.status.in_([  # type: ignore
                     InvoiceStatus.SENT,
                     InvoiceStatus.OVERDUE,
                     InvoiceStatus.PARTIALLY_PAID,
                 ]),
             )
-            .all()
         )
+
+        result = await db.execute(stmt)
+        outstanding = result.all()
 
         results = []
         for txn in transactions:

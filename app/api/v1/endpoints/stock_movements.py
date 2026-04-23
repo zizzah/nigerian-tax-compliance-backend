@@ -2,13 +2,13 @@
 app/api/v1/endpoints/stock_movements.py
 Handles stock IN/OUT movements, history, and restocking
 """
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
-from sqlalchemy import func, text, extract
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text, select
 from typing import Optional
-from datetime import date, datetime
+from datetime import date
 from pydantic import BaseModel
-import uuid
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -19,10 +19,17 @@ from app.models.product import Product
 router = APIRouter(prefix="/stock-movements", tags=["stock-movements"])
 
 
-def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.user_id == user.id).first()
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+async def _get_business(db: AsyncSession, user: User) -> Business:
+    result = await db.execute(
+        select(Business).where(Business.user_id == user.id)
+    )
+    biz = result.scalar_one_or_none()
+
     if not biz:
         raise HTTPException(status_code=404, detail="Business not found")
+
     return biz
 
 
@@ -38,7 +45,7 @@ class StockInRequest(BaseModel):
 
 class StockAdjustRequest(BaseModel):
     product_id: str
-    quantity: float          # positive = add, negative = remove
+    quantity: float
     reason: Optional[str] = None
     movement_date: Optional[date] = None
 
@@ -46,22 +53,28 @@ class StockAdjustRequest(BaseModel):
 # ── GET /stock-movements/{product_id} ─────────────────────────────────────────
 
 @router.get("/{product_id}")
-def get_product_movements(
+async def get_product_movements(
     product_id: str,
     limit: int = Query(50, le=200),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
 
-    product = db.query(Product).filter(
-        Product.id == product_id,
-        Product.business_id == biz.id,
-    ).first()
+    # Get product
+    result = await db.execute(
+        select(Product).where(
+            Product.id == product_id,
+            Product.business_id == biz.id,
+        )
+    )
+    product = result.scalar_one_or_none()
+
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    rows = db.execute(text("""
+    # Movements
+    result = await db.execute(text("""
         SELECT
             sm.id, sm.movement_type, sm.quantity, sm.unit_cost,
             sm.note, sm.movement_date, sm.created_at,
@@ -76,36 +89,43 @@ def get_product_movements(
         "product_id": product_id,
         "biz_id": str(biz.id),
         "limit": limit,
-    }).fetchall()
+    })
+
+    rows = result.fetchall()
 
     # Totals
-    totals = db.execute(text("""
+    result = await db.execute(text("""
         SELECT
             COALESCE(SUM(CASE WHEN movement_type = 'IN'  THEN quantity ELSE 0 END), 0) AS total_in,
             COALESCE(SUM(CASE WHEN movement_type = 'OUT' THEN quantity ELSE 0 END), 0) AS total_out
         FROM stock_movements
         WHERE product_id = :product_id
           AND business_id = :biz_id
-    """), {"product_id": product_id, "biz_id": str(biz.id)}).fetchone()
+    """), {
+        "product_id": product_id,
+        "biz_id": str(biz.id)
+    })
 
-    total_in  = float(totals.total_in  or 0) # type: ignore
+    totals = result.fetchone()
+
+    total_in  = float(totals.total_in or 0) # type: ignore
     total_out = float(totals.total_out or 0) # type: ignore
     available = total_in - total_out
 
     return {
-        "product_id":  product_id,
+        "product_id": product_id,
         "product_name": product.name,
-        "total_in":    total_in,
-        "total_out":   total_out,   # = total sold (ever)
-        "available":   available,
+        "total_in": total_in,
+        "total_out": total_out,
+        "available": available,
         "movements": [
             {
-                "id":             str(r.id),
-                "type":           r.movement_type,
-                "quantity":       float(r.quantity),
-                "unit_cost":      float(r.unit_cost) if r.unit_cost else None,
-                "note":           r.note,
-                "movement_date":  str(r.movement_date),
+                "id": str(r.id),
+                "type": r.movement_type,
+                "quantity": float(r.quantity),
+                "unit_cost": float(r.unit_cost) if r.unit_cost else None,
+                "note": r.note,
+                "movement_date": str(r.movement_date),
                 "invoice_number": r.invoice_number,
             }
             for r in rows
@@ -113,16 +133,16 @@ def get_product_movements(
     }
 
 
-# ── GET /stock-movements/ — all products summary ──────────────────────────────
+# ── GET /stock-movements/ ─────────────────────────────────────────────────────
 
 @router.get("/")
-def get_all_stock_summary(
-    db: Session = Depends(get_db),
+async def get_all_stock_summary(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
 
-    rows = db.execute(text("""
+    result = await db.execute(text("""
         SELECT
             p.id,
             p.name,
@@ -143,21 +163,23 @@ def get_all_stock_summary(
         GROUP BY p.id, p.name, p.sku, p.unit_price, p.cost_price,
                  p.low_stock_threshold, p.track_inventory
         ORDER BY p.name
-    """), {"biz_id": str(biz.id)}).fetchall()
+    """), {"biz_id": str(biz.id)})
+
+    rows = result.fetchall()
 
     return [
         {
-            "product_id":          str(r.id),
-            "name":                r.name,
-            "sku":                 r.sku,
-            "unit_price":          float(r.unit_price or 0),
-            "cost_price":          float(r.cost_price or 0),
+            "product_id": str(r.id),
+            "name": r.name,
+            "sku": r.sku,
+            "unit_price": float(r.unit_price or 0),
+            "cost_price": float(r.cost_price or 0),
             "low_stock_threshold": r.low_stock_threshold,
-            "total_in":            float(r.total_in),
-            "total_sold":          float(r.total_sold),
-            "available":           float(r.available),
-            "is_low":              float(r.available) <= (r.low_stock_threshold or 0),
-            "is_out":              float(r.available) <= 0,
+            "total_in": float(r.total_in),
+            "total_sold": float(r.total_sold),
+            "available": float(r.available),
+            "is_low": float(r.available) <= (r.low_stock_threshold or 0),
+            "is_out": float(r.available) <= 0,
         }
         for r in rows
     ]
@@ -166,18 +188,22 @@ def get_all_stock_summary(
 # ── POST /stock-movements/restock ─────────────────────────────────────────────
 
 @router.post("/restock")
-def add_stock(
+async def add_stock(
     body: StockInRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Add new stock (IN movement). Does NOT reset total_sold."""
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
 
-    product = db.query(Product).filter(
-        Product.id == body.product_id,
-        Product.business_id == biz.id,
-    ).first()
+    # Get product
+    result = await db.execute(
+        select(Product).where(
+            Product.id == body.product_id,
+            Product.business_id == biz.id,
+        )
+    )
+    product = result.scalar_one_or_none()
+
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -186,39 +212,50 @@ def add_stock(
 
     movement_date = body.movement_date or date.today()
 
-    db.execute(text("""
+    # Insert movement
+    await db.execute(text("""
         INSERT INTO stock_movements
             (id, business_id, product_id, movement_type, quantity, unit_cost, note, movement_date)
         VALUES
             (gen_random_uuid(), :biz_id, :product_id, 'IN', :qty, :cost, :note, :dt)
     """), {
-        "biz_id":     str(biz.id),
+        "biz_id": str(biz.id),
         "product_id": body.product_id,
-        "qty":        body.quantity,
-        "cost":       body.unit_cost or product.cost_price,
-        "note":       body.note or "Stock replenishment",
-        "dt":         movement_date,
+        "qty": body.quantity,
+        "cost": body.unit_cost or product.cost_price,
+        "note": body.note or "Stock replenishment",
+        "dt": movement_date,
     })
 
-    # Sync quantity_in_stock on product table for compatibility
-    new_available = db.execute(text("""
+    # Recalculate stock
+    result = await db.execute(text("""
         SELECT
             COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END),0)
           - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END),0)
         FROM stock_movements
         WHERE product_id = :pid AND business_id = :biz_id
-    """), {"pid": body.product_id, "biz_id": str(biz.id)}).scalar()
+    """), {
+        "pid": body.product_id,
+        "biz_id": str(biz.id)
+    })
 
-    db.execute(text("""
+    new_available = result.scalar()
+
+    # Update product
+    await db.execute(text("""
         UPDATE products SET quantity_in_stock = :qty
         WHERE id = :pid AND business_id = :biz_id
-    """), {"qty": float(new_available or 0), "pid": body.product_id, "biz_id": str(biz.id)})
+    """), {
+        "qty": float(new_available or 0),
+        "pid": body.product_id,
+        "biz_id": str(biz.id)
+    })
 
-    db.commit()
+    await db.commit()
 
     return {
-        "success":   True,
+        "success": True,
         "added_qty": body.quantity,
         "available": float(new_available or 0),
-        "message":   str(int(body.quantity)) + " units of " + product.name + " added to stock",
+        "message": f"{int(body.quantity)} units of {product.name} added to stock",
     }

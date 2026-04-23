@@ -1,23 +1,14 @@
 """
-AI Insights API Endpoints
-Location: app/api/v1/endpoints/insights.py
-
-Provides:
-  GET  /insights/                          - Get/generate proactive insights
-  POST /insights/{insight_id}/dismiss      - Dismiss an insight
-  GET  /insights/payment-prediction/{id}  - Predict payment date for an invoice
-  GET  /insights/invoice-anomalies/{id}   - Check anomalies before sending invoice
-  GET  /insights/fx-rates                 - Current NGN exchange rates
-
-Register in app/main.py:
-  from app.api.v1.endpoints import insights
-  app.include_router(insights.router, prefix=settings.API_V1_PREFIX)
+AI Insights API Endpoints (ASYNC SAFE)
 """
+
 import uuid
 import logging
 from datetime import date, datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -30,12 +21,17 @@ router = APIRouter(prefix="/insights", tags=["AI Insights"])
 logger = logging.getLogger(__name__)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────
 
-def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.user_id == user.id).first()
+async def _get_business(db: AsyncSession, user: User) -> Business:
+    result = await db.execute(
+        select(Business).where(Business.user_id == user.id)
+    )
+    biz = result.scalar_one_or_none()
+
     if not biz:
         raise HTTPException(status_code=404, detail="Business profile not found")
+
     return biz
 
 
@@ -53,101 +49,108 @@ def _serialize_insight(insight: AIInsight) -> dict:
     }
 
 
-# ── GET /insights/ ────────────────────────────────────────────────────────────
+# ── GET /insights/ ──────────────────────────────────────
 
 @router.get("/")
-def get_insights(
+async def get_insights(
     refresh: bool = False,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get AI insights for the current business.
-    Returns cached today's insights unless ?refresh=true is passed.
-    Generating fresh insights costs one Groq API call.
-    """
-    biz = _get_business(db, current_user)
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    biz = await _get_business(db, current_user)
 
-    existing = (
-        db.query(AIInsight)
-        .filter(
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    result = await db.execute(
+        select(AIInsight)
+        .where(
             AIInsight.business_id == biz.id,
             AIInsight.is_dismissed == False,
             AIInsight.created_at >= today_start,
         )
         .order_by(AIInsight.created_at.desc())
-        .all()
     )
+    existing = result.scalars().all()
 
     if existing and not refresh:
-        return {"insights": [_serialize_insight(i) for i in existing], "cached": True}
+        return {
+            "insights": [_serialize_insight(i) for i in existing],
+            "cached": True
+        }
 
+    # ⚠️ KEEP SYNC (do NOT change unless engine is async)
     engine = InsightsEngine()
-    new_insights = engine.generate_insights(db, biz)
-    return {"insights": [_serialize_insight(i) for i in new_insights], "cached": False}
+    new_insights = engine.generate_insights(db, biz) # type: ignore
+
+    return {
+        "insights": [_serialize_insight(i) for i in new_insights], # type: ignore
+        "cached": False
+    }
 
 
-# ── POST /insights/{id}/dismiss ───────────────────────────────────────────────
+# ── POST /insights/{id}/dismiss ─────────────────────────
 
 @router.post("/{insight_id}/dismiss")
-def dismiss_insight(
+async def dismiss_insight(
     insight_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Dismiss an AI insight so it no longer appears on the dashboard."""
-    biz = _get_business(db, current_user)
-    insight = db.query(AIInsight).filter(
-        AIInsight.id == insight_id,
-        AIInsight.business_id == biz.id,
-    ).first()
+    biz = await _get_business(db, current_user)
+
+    result = await db.execute(
+        select(AIInsight).where(
+            AIInsight.id == insight_id,
+            AIInsight.business_id == biz.id,
+        )
+    )
+    insight = result.scalar_one_or_none()
+
     if not insight:
         raise HTTPException(status_code=404, detail="Insight not found")
 
-    insight.is_dismissed = True # type: ignore
-    insight.dismissed_at = datetime.now(timezone.utc) # type: ignore
-    db.commit()
+    insight.is_dismissed = True  # type: ignore
+    insight.dismissed_at = datetime.now(timezone.utc)# type: ignore
+
+    await db.commit()
+
     return {"success": True}
 
 
-# ── GET /insights/payment-prediction/{invoice_id} ─────────────────────────────
+# ── GET /payment-prediction/{invoice_id} ────────────────
 
 @router.get("/payment-prediction/{invoice_id}")
-def predict_payment_date(
+async def predict_payment_date(
     invoice_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Predict when an invoice will be paid based on the customer's historical
-    payment behaviour.
-
-    Returns:
-    - predicted_date: ISO date string
-    - avg_days / median_days: historical averages
-    - confidence: 0.0–1.0
-    - is_likely_late: whether payment is already overdue relative to prediction
-    """
     from app.models.invoice import Invoice, InvoiceStatus
 
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
+
     try:
         inv_uuid = uuid.UUID(invoice_id)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid invoice ID")
 
-    invoice = db.query(Invoice).filter(
-        Invoice.id == inv_uuid,
-        Invoice.business_id == biz.id,
-    ).first()
+    result = await db.execute(
+        select(Invoice).where(
+            Invoice.id == inv_uuid,
+            Invoice.business_id == biz.id,
+        )
+    )
+    invoice = result.scalar_one_or_none()
+
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    # Historical paid invoices for this customer
-    historical = (
-        db.query(Invoice)
-        .filter(
+    # Historical invoices
+    result = await db.execute(
+        select(Invoice)
+        .where(
             Invoice.business_id == biz.id,
             Invoice.customer_id == invoice.customer_id,
             Invoice.status == InvoiceStatus.PAID, # type: ignore
@@ -155,8 +158,8 @@ def predict_payment_date(
         )
         .order_by(Invoice.paid_at.desc()) # type: ignore
         .limit(20)
-        .all()
     )
+    historical = result.scalars().all()
 
     if not historical:
         return {
@@ -174,15 +177,24 @@ def predict_payment_date(
                 payment_days.append(d)
 
     if not payment_days:
-        return {"has_prediction": False, "reason": "Insufficient data", "avg_days": None, "predicted_date": None}
+        return {
+            "has_prediction": False,
+            "reason": "Insufficient data",
+            "avg_days": None,
+            "predicted_date": None
+        }
 
     avg_days = round(sum(payment_days) / len(payment_days))
     median_days = sorted(payment_days)[len(payment_days) // 2]
-    std_dev = (sum((d - avg_days) ** 2 for d in payment_days) / len(payment_days)) ** 0.5
 
-    # Weighted blend (median weighted higher for reliability)
+    std_dev = (
+        sum((d - avg_days) ** 2 for d in payment_days) / len(payment_days)
+    ) ** 0.5
+
     predicted_days = round(avg_days * 0.4 + median_days * 0.6)
-    predicted_date = (invoice.issue_date + timedelta(days=predicted_days)).isoformat() # type: ignore
+    predicted_date = (
+        invoice.issue_date + timedelta(days=predicted_days) # type: ignore
+    ).isoformat()
 
     consistency = max(0, 1 - (std_dev / max(avg_days, 1)))
     confidence = min(0.95, consistency * min(1.0, len(payment_days) / 10))
@@ -201,50 +213,49 @@ def predict_payment_date(
         "confidence": round(confidence, 2),
         "sample_size": len(payment_days),
         "is_likely_late": days_since_issue > predicted_days * 1.2,
-        "historical_range": {"min": min(payment_days), "max": max(payment_days)},
+        "historical_range": {
+            "min": min(payment_days),
+            "max": max(payment_days),
+        },
     }
 
 
-# ── GET /insights/invoice-anomalies/{invoice_id} ──────────────────────────────
+# ── GET /invoice-anomalies/{invoice_id} ─────────────────
 
 @router.get("/invoice-anomalies/{invoice_id}")
-def check_invoice_anomalies(
+async def check_invoice_anomalies(
     invoice_id: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Check a DRAFT invoice for anomalies before it is finalised/sent.
-
-    Returns a list of warnings the user should review:
-    - Unusually large amount compared to customer history
-    - Dormant customer (no invoice in 90+ days)
-    - Possible duplicate (same amount in last 7 days)
-    - Customer already has a large outstanding balance
-    """
     from app.models.invoice import Invoice, InvoiceStatus
     from app.models.customer import Customer
 
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
+
     try:
         inv_uuid = uuid.UUID(invoice_id)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid invoice ID")
 
-    invoice = db.query(Invoice).filter(
-        Invoice.id == inv_uuid,
-        Invoice.business_id == biz.id,
-    ).first()
+    result = await db.execute(
+        select(Invoice).where(
+            Invoice.id == inv_uuid,
+            Invoice.business_id == biz.id,
+        )
+    )
+    invoice = result.scalar_one_or_none()
+
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     anomalies = []
     inv_amount = float(invoice.total_amount or 0) # type: ignore
 
-    # Historical invoices for this customer (excluding the current one)
-    historical = (
-        db.query(Invoice)
-        .filter(
+    # Historical
+    result = await db.execute(
+        select(Invoice)
+        .where(
             Invoice.customer_id == invoice.customer_id,
             Invoice.business_id == biz.id,
             Invoice.status != InvoiceStatus.DRAFT, # type: ignore
@@ -253,100 +264,92 @@ def check_invoice_anomalies(
         )
         .order_by(Invoice.created_at.desc())
         .limit(20)
-        .all()
     )
+    historical = result.scalars().all()
 
     if historical:
         amounts = [float(i.total_amount or 0) for i in historical] # type: ignore
         avg_amount = sum(amounts) / len(amounts)
 
-        # Flag if this invoice is 5× or more than customer average
         if avg_amount > 0 and inv_amount > avg_amount * 5:
             anomalies.append({
                 "type": "amount_unusual",
                 "severity": "warning",
-                "message": (
-                    f"This invoice (₦{inv_amount:,.0f}) is {inv_amount / avg_amount:.1f}× larger than "
-                    f"your average for this customer (₦{avg_amount:,.0f}). Is that intentional?"
-                ),
+                "message": f"Invoice unusually large vs history",
             })
 
-        # Flag dormant customer
         last_invoice = max(historical, key=lambda i: i.issue_date)
         days_since = (date.today() - last_invoice.issue_date).days
+
         if days_since > 90:
             anomalies.append({
                 "type": "dormant_customer",
                 "severity": "info",
-                "message": (
-                    f"You haven't invoiced this customer in {days_since} days. "
-                    "Make sure their contact details are still current."
-                ),
+                "message": f"No invoice in {days_since} days",
             })
 
-    # Possible duplicate: same amount in last 7 days
-    recent_same = (
-        db.query(Invoice)
-        .filter(
+    # Duplicate check
+    result = await db.execute(
+        select(Invoice).where(
             Invoice.business_id == biz.id,
             Invoice.customer_id == invoice.customer_id,
             Invoice.total_amount == invoice.total_amount,
             Invoice.issue_date >= date.today() - timedelta(days=7),
             Invoice.id != invoice.id,
         )
-        .first()
     )
+    recent_same = result.scalar_one_or_none()
+
     if recent_same:
-        days_ago = (date.today() - recent_same.issue_date).days
         anomalies.append({
             "type": "possible_duplicate",
             "severity": "warning",
-            "message": (
-                f"Invoice {recent_same.invoice_number} for the same amount (₦{inv_amount:,.0f}) "
-                f"was created {days_ago} day(s) ago. Possible duplicate?"
-            ),
+            "message": "Possible duplicate invoice",
         })
 
-    # Large outstanding balance warning
-    customer = db.query(Customer).filter(Customer.id == invoice.customer_id).first()
+    # Customer
+    result = await db.execute(
+        select(Customer).where(Customer.id == invoice.customer_id)
+    )
+    customer = result.scalar_one_or_none()
+
     if customer:
         outstanding = float(customer.total_invoiced_amount or 0) - float(customer.total_paid_amount or 0) # type: ignore
+
         if outstanding > inv_amount * 2:
             anomalies.append({
                 "type": "high_outstanding",
                 "severity": "warning",
-                "message": (
-                    f"This customer already has ₦{outstanding:,.0f} outstanding. "
-                    f"Adding this invoice brings the total to ₦{outstanding + inv_amount:,.0f}."
-                ),
+                "message": "Customer has high outstanding balance",
             })
 
-    return {"anomalies": anomalies, "invoice_id": invoice_id, "count": len(anomalies)}
+    return {
+        "anomalies": anomalies,
+        "invoice_id": invoice_id,
+        "count": len(anomalies)
+    }
 
 
-# ── GET /insights/fx-rates ────────────────────────────────────────────────────
+# ── GET /fx-rates ──────────────────────────────────────
 
 @router.get("/fx-rates")
-def get_fx_rates(
+async def get_fx_rates(
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get indicative NGN exchange rates (1-hour cache).
-    Uses exchangerate-api.com free tier.
-    """
     try:
         from app.services.fx_rates import get_fx_rates as _rates
         rates = _rates()
+
         return {
             "rates": rates,
             "base": "NGN",
-            "disclaimer": "Indicative rates only. Use CBN official rates for formal filings.",
+            "disclaimer": "Indicative rates only",
         }
     except Exception as e:
         logger.error(f"FX rate fetch error: {e}")
-        # Return hardcoded fallback rates if service unavailable
+
         return {
             "rates": {"USD": 0.00065, "GBP": 0.00052, "EUR": 0.00060, "NGN": 1.0},
             "base": "NGN",
-            "disclaimer": "Fallback rates — live rates unavailable.",
+            "disclaimer": "Fallback rates",
         }

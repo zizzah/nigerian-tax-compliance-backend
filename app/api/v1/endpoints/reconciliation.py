@@ -1,17 +1,7 @@
 """
-Bank Statement Reconciliation Endpoints
-Location: app/api/v1/endpoints/reconciliation.py
-
-Endpoints:
-  POST /reconciliation/upload      — upload statement, AI-match transactions, persist record
-  POST /reconciliation/apply       — apply confirmed matches (mark invoices paid)
-  GET  /reconciliation/            — list past reconciliation runs
-  GET  /reconciliation/{id}        — get a single reconciliation run with full detail
-
-Register in app/main.py:
-  from app.api.v1.endpoints import reconciliation
-  app.include_router(reconciliation.router, prefix=settings.API_V1_PREFIX)
+Bank Statement Reconciliation Endpoints (ASYNC VERSION)
 """
+
 import math
 import uuid
 import logging
@@ -21,7 +11,8 @@ from datetime import date as date_type, datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -46,90 +37,72 @@ router = APIRouter(prefix="/reconciliation", tags=["Bank Reconciliation"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.user_id == user.id).first()
+async def _get_business(db: AsyncSession, user: User) -> Business:
+    result = await db.execute(
+        select(Business).where(Business.user_id == user.id)
+    )
+    biz = result.scalar_one_or_none()
+
     if not biz:
         raise HTTPException(status_code=404, detail="Business profile not found")
+
     return biz
 
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from a PDF using PyMuPDF. Falls back to raw UTF-8 decode."""
     try:
-        import fitz  # PyMuPDF — add pymupdf>=1.24.0 to requirements.txt
+        import fitz
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file_bytes)
             tmp_path = tmp.name
         doc = fitz.open(tmp_path)
-        text = "\n".join(page.get_text() for page in doc) # type: ignore
+        text = "\n".join(page.get_text() for page in doc)  # type: ignore
         doc.close()
         os.unlink(tmp_path)
         return text
     except ImportError:
-        logger.warning("PyMuPDF not installed — falling back to raw text decode for PDF")
+        logger.warning("PyMuPDF not installed — fallback to raw decode")
         return file_bytes.decode("utf-8", errors="replace")
     except Exception as e:
-        logger.warning(f"PDF text extraction failed: {e}")
+        logger.warning(f"PDF extraction failed: {e}")
         return file_bytes.decode("utf-8", errors="replace")
 
 
-# ── POST /reconciliation/upload ───────────────────────────────────────────────
+# ── POST /upload ──────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=BankReconciliationUploadResponse, status_code=201)
 async def upload_bank_statement(
     file: UploadFile = File(...),
     bank_name: str = Form(default=""),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Upload a bank statement (CSV, TXT, or PDF) for AI reconciliation.
+    biz = await _get_business(db, current_user)
 
-    Steps:
-    1. Extract text from the uploaded file.
-    2. Use Groq to parse all CREDIT transactions.
-    3. Match each transaction to outstanding invoices (amount + name heuristics).
-    4. Persist a BankReconciliation record (status=completed).
-    5. Return the full match list for user review.
-
-    After reviewing the matches the frontend calls POST /reconciliation/apply.
-    """
-    biz = _get_business(db, current_user)
     content = await file.read()
     filename = file.filename or "statement"
 
-    # ── Extract text ──────────────────────────────────────────────────────────
     if filename.lower().endswith(".pdf") or file.content_type == "application/pdf":
         text = _extract_pdf_text(content)
     else:
         text = content.decode("utf-8", errors="replace")
 
     if not text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract any text from the uploaded file.",
-        )
+        raise HTTPException(status_code=400, detail="Could not extract text.")
 
-    # ── AI processing ─────────────────────────────────────────────────────────
     reconciler = BankReconciler()
     transactions = reconciler.parse_statement_text(text, bank_name)
 
     if not transactions:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No credit transactions found in the statement. "
-                "Ensure this is a bank statement with incoming payments."
-            ),
-        )
+        raise HTTPException(status_code=422, detail="No credit transactions found.")
 
+    # ⚠️ IMPORTANT: keep db passed as-is (no await inside service)
     matches = reconciler.match_transactions(transactions, str(biz.id), db)
 
-    matched   = [m for m in matches if m["matched"]]
-    unmatched = [m for m in matches if not m["matched"]]
-    total_credits = round(sum(float(m["transaction"].get("amount", 0)) for m in matches), 2)
+    matched   = [m for m in matches if m["matched"]] # type: ignore
+    unmatched = [m for m in matches if not m["matched"]] # type: ignore
+    total_credits = round(sum(float(m["transaction"].get("amount", 0)) for m in matches), 2) # type: ignore
 
-    # ── Persist BankReconciliation record ─────────────────────────────────────
     recon = BankReconciliation(
         id=uuid.uuid4(),
         business_id=biz.id,
@@ -142,9 +115,10 @@ async def upload_bank_statement(
         raw_transactions=transactions,
         match_results=matches,
     )
+
     db.add(recon)
-    db.commit()
-    db.refresh(recon)
+    await db.commit()
+    await db.refresh(recon)
 
     return BankReconciliationUploadResponse(
         reconciliation_id=str(recon.id),
@@ -155,29 +129,20 @@ async def upload_bank_statement(
         unmatched_count=len(unmatched),
         total_credit_amount=total_credits,
         status="completed",
-        matches=matches,
+        matches=matches, # type: ignore
     )
 
 
-# ── POST /reconciliation/apply ────────────────────────────────────────────────
+# ── POST /apply ───────────────────────────────────────────────────────────────
 
 @router.post("/apply", response_model=BankReconciliationApplyResponse)
-def apply_reconciliation(
+async def apply_reconciliation(
     request: ApplyMatchRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Apply user-confirmed reconciliation matches.
+    biz = await _get_business(db, current_user)
 
-    For each confirmed match:
-    - Creates a Payment record (method = BANK_TRANSFER)
-    - Updates invoice paid_amount / outstanding_amount
-    - Marks the invoice PAID if fully settled
-
-    Optionally updates the parent BankReconciliation record status.
-    """
-    biz = _get_business(db, current_user)
     applied = []
     errors: list[str] = []
 
@@ -186,20 +151,23 @@ def apply_reconciliation(
             continue
 
         try:
-            inv = db.query(Invoice).filter(
-                Invoice.id == uuid.UUID(match["invoice_id"]),
-                Invoice.business_id == biz.id,
-            ).first()
+            result = await db.execute(
+                select(Invoice).where(
+                    Invoice.id == uuid.UUID(match["invoice_id"]),
+                    Invoice.business_id == biz.id,
+                )
+            )
+            inv = result.scalar_one_or_none()
 
             if not inv:
                 errors.append(f"Invoice {match['invoice_id']} not found")
                 continue
 
             txn = match["transaction"]
-            txn_date_str = txn.get("date", date_type.today().isoformat())
+
             try:
-                txn_date = date_type.fromisoformat(txn_date_str)
-            except (ValueError, TypeError):
+                txn_date = date_type.fromisoformat(txn.get("date"))
+            except Exception:
                 txn_date = date_type.today()
 
             amount = float(txn.get("amount", 0))
@@ -227,28 +195,28 @@ def apply_reconciliation(
             applied.append(AppliedMatchSchema(
                 invoice_number=str(inv.invoice_number),
                 amount_applied=amount,
-                new_status=(
-                    inv.status.value if hasattr(inv.status, "value") else str(inv.status)
-                ),
+                new_status=str(inv.status.value if hasattr(inv.status, "value") else inv.status),
             ))
 
         except Exception as e:
-            logger.error(f"Failed to apply match for invoice {match.get('invoice_id')}: {e}")
+            logger.error(f"Apply failed: {e}")
             errors.append(str(e))
 
-    # Optionally mark the parent reconciliation as having been acted upon
     if request.reconciliation_id:
         try:
-            recon = db.query(BankReconciliation).filter(
-                BankReconciliation.id == uuid.UUID(request.reconciliation_id),
-                BankReconciliation.business_id == biz.id,
-            ).first()
+            result = await db.execute(
+                select(BankReconciliation).where(
+                    BankReconciliation.id == uuid.UUID(request.reconciliation_id),
+                    BankReconciliation.business_id == biz.id,
+                )
+            )
+            recon = result.scalar_one_or_none()
             if recon:
                 recon.status = "applied" # type: ignore
         except Exception:
-            pass  # Non-critical; don't fail the whole apply
+            pass
 
-    db.commit()
+    await db.commit()
 
     return BankReconciliationApplyResponse(
         applied_count=len(applied),
@@ -258,26 +226,35 @@ def apply_reconciliation(
     )
 
 
-# ── GET /reconciliation/ ──────────────────────────────────────────────────────
+# ── GET / ─────────────────────────────────────────────────────────────────────
 
 @router.get("/", response_model=BankReconciliationListResponse)
-def list_reconciliations(
+async def list_reconciliations(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List all past bank reconciliation runs for this business, newest first."""
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
 
-    q = (
-        db.query(BankReconciliation)
-        .filter(BankReconciliation.business_id == biz.id)
-        .order_by(BankReconciliation.created_at.desc())
+    # total count
+    result = await db.execute(
+        select(func.count()).select_from(BankReconciliation).where(
+            BankReconciliation.business_id == biz.id
+        )
     )
-    total = q.count()
+    total = result.scalar() or 0
+
     total_pages = math.ceil(total / page_size)
-    records = q.offset((page - 1) * page_size).limit(page_size).all()
+
+    result = await db.execute(
+        select(BankReconciliation)
+        .where(BankReconciliation.business_id == biz.id)
+        .order_by(BankReconciliation.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    records = result.scalars().all()
 
     return BankReconciliationListResponse(
         reconciliations=[BankReconciliationResponse.model_validate(r) for r in records],
@@ -288,23 +265,25 @@ def list_reconciliations(
     )
 
 
-# ── GET /reconciliation/{id} ──────────────────────────────────────────────────
+# ── GET /{id} ─────────────────────────────────────────────────────────────────
 
 @router.get("/{reconciliation_id}", response_model=BankReconciliationResponse)
-def get_reconciliation(
+async def get_reconciliation(
     reconciliation_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Retrieve a single reconciliation run including all match results."""
-    biz = _get_business(db, current_user)
+    biz = await _get_business(db, current_user)
 
-    recon = db.query(BankReconciliation).filter(
-        BankReconciliation.id == reconciliation_id,
-        BankReconciliation.business_id == biz.id,
-    ).first()
+    result = await db.execute(
+        select(BankReconciliation).where(
+            BankReconciliation.id == reconciliation_id,
+            BankReconciliation.business_id == biz.id,
+        )
+    )
+    recon = result.scalar_one_or_none()
 
     if not recon:
-        raise HTTPException(status_code=404, detail="Reconciliation record not found")
+        raise HTTPException(status_code=404, detail="Reconciliation not found")
 
     return BankReconciliationResponse.model_validate(recon)
