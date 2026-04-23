@@ -6,19 +6,22 @@ Includes all CRUD operations + PDF generation
 """
 import uuid
 import math
-import time
 import os
 import urllib.request
 import tempfile
 import logging
 from io import BytesIO
 from typing import Optional
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone
+
+import asyncio
+
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks  # type: ignore
 from fastapi.responses import Response  # type: ignore
-from sqlalchemy.orm import Session  # type: ignore
-from sqlalchemy import or_, and_, func, text, select  # type: ignore
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import case, select
+from sqlalchemy import func, text, select ,DateTime # type: ignore
 from sqlalchemy.exc import IntegrityError  # type: ignore
 from pydantic import BaseModel
 
@@ -64,9 +67,10 @@ router = APIRouter(prefix="/invoices", tags=["Invoices"])
 # Helper Functions
 # ============================================================================
 
-def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
+async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     """Get user's business or raise 404"""
-    business = db.query(Business).filter(Business.user_id == user_id).first()
+    result = await db.execute(select(Business).where(Business.user_id == user_id))
+    business = result.scalar_one_or_none()
     if not business:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -75,12 +79,13 @@ def get_user_business(db: Session, user_id: uuid.UUID) -> Business:
     return business
 
 
-def verify_customer_belongs_to_business(db: Session, customer_id: uuid.UUID, business_id: uuid.UUID) -> Customer:
+async def verify_customer_belongs_to_business(db: AsyncSession, customer_id: uuid.UUID, business_id: uuid.UUID) -> Customer:
     """Verify customer belongs to business"""
-    customer = db.query(Customer).filter(
+    result = await db.execute(select(Customer).where(
         Customer.id == customer_id,
         Customer.business_id == business_id
-    ).first()
+    ))
+    customer = result.scalar_one_or_none()
     
     if not customer:
         raise HTTPException(
@@ -92,13 +97,43 @@ def verify_customer_belongs_to_business(db: Session, customer_id: uuid.UUID, bus
 
 
 
+async def get_invoice_by_id(db: AsyncSession, invoice_id: uuid.UUID, business_id: uuid.UUID) -> Invoice:
+    """Get invoice by ID, ensuring it belongs to the business"""
+    result = await db.execute(select(Invoice).where(
+        Invoice.id == invoice_id,
+        Invoice.business_id == business_id
+    ))
+    invoice = result.scalar_one_or_none()
+    
+    if not invoice:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invoice not found"
+        )
+    
+    return invoice
 
 
+async def get_customer_by_id(db: AsyncSession, customer_id: uuid.UUID, business_id: uuid.UUID) -> Customer:
+    """Get customer by ID, ensuring it belongs to the business"""
+    result = await db.execute(select(Customer).where(
+        Customer.id == customer_id,
+        Customer.business_id == business_id
+    ))
+    customer = result.scalar_one_or_none()
+    
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found"
+        )
+    
+    return customer
 
 # Replace the generate_unique_invoice_number function with this:
 
 
-def generate_unique_invoice_number(db: Session, business: Business, max_retries: int = 10) -> str:
+async def generate_unique_invoice_number(db: AsyncSession, business: Business, max_retries: int = 10) -> str:
     """
     Generate unique invoice number with database locking (IMPROVED - handles existing duplicates)
     
@@ -117,7 +152,8 @@ def generate_unique_invoice_number(db: Session, business: Business, max_retries:
                 BusinessModel.id == business.id
             ).with_for_update()
             
-            locked_business = db.execute(stmt).scalar_one_or_none()
+            result = await db.execute(stmt)
+            locked_business = result.scalar_one_or_none()
             
             if not locked_business:
                 raise HTTPException(
@@ -135,33 +171,35 @@ def generate_unique_invoice_number(db: Session, business: Business, max_retries:
             # ================================================================
             # NEW: Check if this number already exists (from old duplicates)
             # ================================================================
-            existing = db.query(Invoice).filter(
-                Invoice.invoice_number == invoice_number
-            ).first()
+            check_stmt = select(Invoice).where(Invoice.invoice_number == invoice_number)
+            result = await db.execute(check_stmt)
+            existing = result.scalar_one_or_none()
             
             if existing:
                 # Duplicate found! Log warning and continue to next number
                 logger.warning(
-                    f"Invoice number {invoice_number} already exists (from previous run). "
-                    f"Skipping to next number... (attempt {attempt + 1}/{max_retries})"
+                    "Invoice number %s already exists from previous run; skipping to next number (%d/%d)",
+                    invoice_number,
+                    attempt + 1,
+                    max_retries
                 )
                 # Commit the incremented counter and try again
-                db.commit()
-                time.sleep(0.05)
+                await db.commit()
+                await asyncio.sleep(0.05)
                 continue
             
             # ================================================================
             # Number is unique - commit and return
             # ================================================================
-            db.commit()
+            await db.commit()
             business.invoice_counter = next_counter
             
-            logger.info(f"✓ Generated unique invoice number: {invoice_number}")
+            logger.info("Generated unique invoice number:&%s", invoice_number)
             return invoice_number
             
         except Exception as e:
-            logger.error(f"Error generating invoice number (attempt {attempt + 1}/{max_retries}): {e}")
-            db.rollback()
+            logger.error("Error generating invoice number (attempt %d/%d): %s", attempt + 1, max_retries, e)
+            await db.rollback()
             
             if attempt == max_retries - 1:
                 raise HTTPException(
@@ -169,7 +207,7 @@ def generate_unique_invoice_number(db: Session, business: Business, max_retries:
                     detail=f"Failed to generate unique invoice number after {max_retries} attempts"
                 )
             
-            time.sleep(0.1 * (attempt + 1))
+            await asyncio.sleep(0.1 * (attempt + 1))
     
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -194,7 +232,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     if not primary_hex.startswith('#') or len(primary_hex) != 7:
         primary_hex = '#c8952a'
     if not secondary_hex.startswith('#') or len(secondary_hex) != 7:
-        secondary_hex = '#1a6b4a'
+        secondary_hex = "#ffffff"
 
     col_primary   = colors.HexColor(primary_hex)
     col_secondary = colors.HexColor(secondary_hex)
@@ -402,113 +440,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
 # INVOICE CRUD ENDPOINTS (keeping existing code)
 # ============================================================================
 
-@router.post("/", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
-async def create_invoice(
-    invoice_data: InvoiceCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Create a new invoice with improved error handling"""
-    try:
-        business = get_user_business(db, current_user.id) # type: ignore
-        customer = verify_customer_belongs_to_business(db, invoice_data.customer_id, business.id) # type: ignore
-        invoice_number = generate_unique_invoice_number(db, business)
-        
-        invoice = Invoice(
-            business_id=business.id,
-            customer_id=customer.id,
-            invoice_number=invoice_number,
-            issue_date=invoice_data.issue_date,
-            due_date=invoice_data.due_date,
-            discount_amount=invoice_data.discount_amount,
-            payment_terms=invoice_data.payment_terms or f"Payment due within {customer.payment_terms_days} days",
-            notes=invoice_data.notes,
-            internal_notes=invoice_data.internal_notes,
-            status=InvoiceStatus.DRAFT
-        )
-        
-        db.add(invoice)
-        
-        try:
-            db.flush()
-        except IntegrityError as e:
-            db.rollback()
-            if "ix_invoices_invoice_number" in str(e):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Invoice number {invoice_number} already exists. Please try again."
-                )
-            raise
-        
-        for idx, item_data in enumerate(invoice_data.items):
-            item = InvoiceItem(
-                invoice_id=invoice.id,
-                product_id=item_data.product_id,
-                description=item_data.description,
-                quantity=item_data.quantity,
-                unit_price=item_data.unit_price,
-                discount_percent=item_data.discount_percent,
-                tax_rate=item_data.tax_rate,
-                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
-            )
-            
-            item.calculate_totals()
-            db.add(item)
-            
-            if item_data.product_id:
-                product = db.query(Product).filter(Product.id == item_data.product_id).first()
-                if product:
-                    product.increment_usage()
-                    # Record stock OUT movement for inventory tracking
-                    if product.track_inventory: # type: ignore
-                        try:
-                            db.execute(text("""
-                                INSERT INTO stock_movements
-                                    (id, business_id, product_id, invoice_id,
-                                     movement_type, quantity, unit_cost, note, movement_date)
-                                VALUES
-                                    (gen_random_uuid(), :biz_id, :product_id, :invoice_id,
-                                     'OUT', :qty, :cost, :note, :dt)
-                            """), {
-                                "biz_id":     str(invoice.business_id),
-                                "product_id": str(product.id),
-                                "invoice_id": str(invoice.id),
-                                "qty":        float(item_data.quantity),
-                                "cost":       float(product.cost_price) if product.cost_price else None, # type: ignore
-                                "note":       "Sale - " + invoice.invoice_number,
-                                "dt":         invoice.issue_date or date.today(),
-                            })
-                            # Sync available stock on product
-                            new_qty = db.execute(text("""
-                                SELECT
-                                    COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END),0)
-                                  - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END),0)
-                                FROM stock_movements
-                                WHERE product_id = :pid
-                            """), {"pid": str(product.id)}).scalar()
-                            product.quantity_in_stock = float(new_qty or 0) # type: ignore
-                        except Exception:
-                            pass  # stock_movements table may not exist yet
-        
-        db.flush()
-        db.refresh(invoice)
-        invoice.calculate_totals()
-        business.invoice_counter += 1
-        
-        db.commit()
-        db.refresh(invoice)
-        
-        return invoice
-        
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create invoice: {str(e)}"
-        )
+
 
 
 @router.get("/", response_model=InvoiceListResponse)
@@ -520,30 +452,35 @@ async def list_invoices(
     from_date: Optional[date] = Query(None),
     to_date: Optional[date] = Query(None),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get paginated list of invoices"""
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    query = db.query(Invoice).filter(Invoice.business_id == business.id)
-    
+    business = await get_user_business(db, current_user.id) # type: ignore
+
+    filters = [Invoice.business_id == business.id]
     if status:
-        query = query.filter(Invoice.status == status) # type: ignore
+        filters.append(Invoice.status == status) # type: ignore
     if customer_id:
-        query = query.filter(Invoice.customer_id == customer_id)
+        filters.append(Invoice.customer_id == customer_id)
     if from_date:
-        query = query.filter(Invoice.issue_date >= from_date)
+        filters.append(Invoice.issue_date >= from_date)
     if to_date:
-        query = query.filter(Invoice.issue_date <= to_date)
-    
-    total = query.count()
+        filters.append(Invoice.issue_date <= to_date)
+
+    total = (await db.execute(
+        select(func.count()).select_from(Invoice).where(*filters)
+    )).scalar_one()
+
     total_pages = math.ceil(total / page_size)
     offset = (page - 1) * page_size
-    
-    invoices = query.order_by(Invoice.created_at.desc())\
-        .offset(offset)\
-        .limit(page_size)\
-        .all()
+
+    invoices = (await db.execute(
+        select(Invoice)
+        .where(*filters)
+        .order_by(Invoice.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )).scalars().all()
     
     return {
         "invoices": invoices,
@@ -558,21 +495,12 @@ async def list_invoices(
 async def get_invoice(
     invoice_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get a specific invoice by ID"""
-    business = get_user_business(db, current_user.id) # type: ignore
+    business = await get_user_business(db, current_user.id) # type: ignore
     
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
-    
-    if not invoice:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invoice not found"
-        )
+    invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
     
     return invoice
 
@@ -582,22 +510,13 @@ async def update_invoice(
     invoice_id: uuid.UUID,
     invoice_data: InvoiceUpdate,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Update an invoice (only DRAFT invoices can be fully updated)"""
     try:
-        business = get_user_business(db, current_user.id) # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         
-        invoice = db.query(Invoice).filter(
-            Invoice.id == invoice_id,
-            Invoice.business_id == business.id
-        ).first()
-        
-        if not invoice:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Invoice not found"
-            )
+        invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
         
         if invoice.status != InvoiceStatus.DRAFT: # type: ignore
             allowed_fields = {'notes', 'internal_notes', 'payment_terms'}
@@ -615,19 +534,19 @@ async def update_invoice(
         for field, value in update_data.items():
             setattr(invoice, field, value)
         
-        db.commit()
-        db.refresh(invoice)
+        await db.commit()
+        await db.refresh(invoice)
         
         return invoice
         
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update invoice: {str(e)}"
+            detail="Failed to update invoice"
         )
 
 
@@ -635,22 +554,13 @@ async def update_invoice(
 async def delete_invoice(
     invoice_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Delete a draft invoice"""
     try:
-        business = get_user_business(db, current_user.id) # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         
-        invoice = db.query(Invoice).filter(
-            Invoice.id == invoice_id,
-            Invoice.business_id == business.id
-        ).first()
-        
-        if not invoice:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Invoice not found"
-            )
+        invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
         
         if invoice.status != InvoiceStatus.DRAFT: # type: ignore
             raise HTTPException(
@@ -658,19 +568,19 @@ async def delete_invoice(
                 detail="Only draft invoices can be deleted. Use cancel endpoint for sent invoices."
             )
         
-        db.delete(invoice)
-        db.commit()
+        await db.delete(invoice)
+        await db.commit()
         
         return None
         
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete invoice: {str(e)}"
+            detail="Failed to delete invoice"
         )
 
 
@@ -678,22 +588,13 @@ async def delete_invoice(
 async def finalize_invoice(
     invoice_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Finalize a draft invoice (mark as SENT)"""
     try:
-        business = get_user_business(db, current_user.id) # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         
-        invoice = db.query(Invoice).filter(
-            Invoice.id == invoice_id,
-            Invoice.business_id == business.id
-        ).first()
-        
-        if not invoice:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Invoice not found"
-            )
+        invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
         
         if invoice.status != InvoiceStatus.DRAFT: # type: ignore
             raise HTTPException(
@@ -702,19 +603,19 @@ async def finalize_invoice(
             )
         
         invoice.mark_as_sent()
-        db.commit()
-        db.refresh(invoice)
+        await db.commit()
+        await db.refresh(invoice)
         
         return invoice
         
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to finalize invoice: {str(e)}"
+            detail="Failed to finalize invoice"
         )
 
 
@@ -723,22 +624,15 @@ async def cancel_invoice(
     invoice_id: uuid.UUID,
     cancel_data: InvoiceCancelRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Cancel an invoice"""
     try:
-        business = get_user_business(db, current_user.id) # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         
-        invoice = db.query(Invoice).filter(
-            Invoice.id == invoice_id,
-            Invoice.business_id == business.id
-        ).first()
+        invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
         
-        if not invoice:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Invoice not found"
-            )
+        
         
         if invoice.status == InvoiceStatus.PAID: # type: ignore
             raise HTTPException(
@@ -757,19 +651,19 @@ async def cancel_invoice(
             invoice.internal_notes = (invoice.internal_notes or "") + cancellation_note # type: ignore
         
         invoice.mark_as_cancelled()
-        db.commit()
-        db.refresh(invoice)
+        await db.commit()
+        await db.refresh(invoice)
         
         return invoice
         
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
     except Exception as e:
-        db.rollback()
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to cancel invoice: {str(e)}"
+            detail="Failed to cancel invoice"
         )
 
 
@@ -778,55 +672,64 @@ async def get_invoice_statistics(
     from_date: Optional[date] = Query(None),
     to_date: Optional[date] = Query(None),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """Get invoice statistics"""
-    business = get_user_business(db, current_user.id) # type: ignore
-    
-    query = db.query(Invoice).filter(Invoice.business_id == business.id)
-    
-    if from_date:
-        query = query.filter(Invoice.issue_date >= from_date)
-    if to_date:
-        query = query.filter(Invoice.issue_date <= to_date)
-    
-    invoices = query.all()
-    
-    total_invoices = len(invoices)
-    draft_invoices = len([i for i in invoices if i.status == InvoiceStatus.DRAFT]) # type: ignore
-    sent_invoices = len([i for i in invoices if i.status == InvoiceStatus.SENT]) # type: ignore
-    paid_invoices = len([i for i in invoices if i.status == InvoiceStatus.PAID]) # type: ignore
-    overdue_invoices = len([i for i in invoices if i.is_overdue])
-    cancelled_invoices = len([i for i in invoices if i.status == InvoiceStatus.CANCELLED]) # type: ignore
-    
-    non_cancelled = [i for i in invoices if i.status != InvoiceStatus.CANCELLED] # type: ignore
-    total_invoiced = sum(i.total_amount for i in non_cancelled)
-    total_paid = sum(i.paid_amount for i in non_cancelled)
-    total_outstanding = total_invoiced - total_paid
-    
-    average_invoice_value = total_invoiced / len(non_cancelled) if non_cancelled else 0
-    
-    paid_inv = [i for i in invoices if i.status == InvoiceStatus.PAID and i.paid_at] # type: ignore
-    if paid_inv:
-        payment_days = [(i.paid_at.date() - i.issue_date).days for i in paid_inv]
-        average_days_to_payment = sum(payment_days) / len(payment_days)
-    else:
-        average_days_to_payment = None
-    
-    return {
-        "total_invoices": total_invoices,
-        "draft_invoices": draft_invoices,
-        "sent_invoices": sent_invoices,
-        "paid_invoices": paid_invoices,
-        "overdue_invoices": overdue_invoices,
-        "cancelled_invoices": cancelled_invoices,
-        "total_invoiced": total_invoiced,
-        "total_paid": total_paid,
-        "total_outstanding": total_outstanding,
-        "average_invoice_value": average_invoice_value,
-        "average_days_to_payment": average_days_to_payment
-    }
+    business = await get_user_business(db, current_user.id)  # type: ignore
 
+    stmt = select(
+        func.count().label("total_invoices"),
+        func.count(case((Invoice.status == InvoiceStatus.DRAFT,      1))).label("draft_invoices"), # type: ignore
+        func.count(case((Invoice.status == InvoiceStatus.SENT,       1))).label("sent_invoices"), # type: ignore
+        func.count(case((Invoice.status == InvoiceStatus.PAID,       1))).label("paid_invoices"), # type: ignore
+        func.count(case((Invoice.status == InvoiceStatus.OVERDUE,    1))).label("overdue_invoices"), # type: ignore
+        func.count(case((Invoice.status == InvoiceStatus.CANCELLED,  1))).label("cancelled_invoices"), # type: ignore
+        func.coalesce(
+            func.sum(case((Invoice.status != InvoiceStatus.CANCELLED, Invoice.total_amount))), # type: ignore
+            0
+        ).label("total_invoiced"),
+        func.coalesce(
+            func.sum(case((Invoice.status != InvoiceStatus.CANCELLED, Invoice.paid_amount))), # type: ignore
+            0
+        ).label("total_paid"),
+    ).select_from(Invoice).where(Invoice.business_id == business.id)
+
+    if from_date:
+        stmt = stmt.where(Invoice.issue_date >= from_date)
+    if to_date:
+        stmt = stmt.where(Invoice.issue_date <= to_date)
+
+    row = (await db.execute(stmt)).one()
+
+    # Average days to payment — separate query, only for PAID invoices
+    avg_stmt = select(
+        func.avg(
+            func.extract("epoch", Invoice.paid_at) - # type: ignore
+            func.extract("epoch", func.cast(Invoice.issue_date, DateTime))
+        ) / 86400
+    ).where(
+        Invoice.business_id == business.id,
+        Invoice.status == InvoiceStatus.PAID, # type: ignore
+        Invoice.paid_at.isnot(None) # type: ignore
+    )
+    avg_days = (await db.execute(avg_stmt)).scalar()
+
+    total_invoiced = float(row.total_invoiced)
+    total_paid     = float(row.total_paid)
+
+    return {
+        "total_invoices":          row.total_invoices,
+        "draft_invoices":          row.draft_invoices,
+        "sent_invoices":           row.sent_invoices,
+        "paid_invoices":           row.paid_invoices,
+        "overdue_invoices":        row.overdue_invoices,
+        "cancelled_invoices":      row.cancelled_invoices,
+        "total_invoiced":          total_invoiced,
+        "total_paid":              total_paid,
+        "total_outstanding":       total_invoiced - total_paid,
+        "average_invoice_value":   total_invoiced / row.total_invoices if row.total_invoices else 0,
+        "average_days_to_payment": float(avg_days) if avg_days is not None else None,
+    }
 
 # ============================================================================
 # PDF GENERATION ENDPOINT (NEW!)
@@ -836,7 +739,7 @@ async def get_invoice_statistics(
 async def download_invoice_pdf(
     invoice_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Generate and download invoice as PDF
@@ -859,19 +762,10 @@ async def download_invoice_pdf(
     
     try:
         # Get business
-        business = get_user_business(db, current_user.id) # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         
         # Get invoice with relationships
-        invoice = db.query(Invoice).filter(
-            Invoice.id == invoice_id,
-            Invoice.business_id == business.id
-        ).first()
-        
-        if not invoice:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Invoice not found"
-            )
+        invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
         
         # Get customer
         customer = invoice.customer
@@ -893,7 +787,7 @@ async def download_invoice_pdf(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate PDF: {str(e)}"
+            detail="Failed to generate PDF"
         )
 
 class SendInvoiceRequest(BaseModel):
@@ -918,33 +812,27 @@ def _fmt_date_str(d) -> str:
 
 
 @router.post("/{invoice_id}/send", status_code=status.HTTP_200_OK)
-def send_invoice(
+async def send_invoice(
     invoice_id: uuid.UUID,
     body: SendInvoiceRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Email an invoice to the customer with PDF attached."""
-    business = get_user_business(db, current_user.id) # type: ignore
+    business = await get_user_business(db, current_user.id) # type: ignore
 
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
+    invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
 
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-
-    if invoice.status == "DRAFT": # type: ignore
+    if invoice.status == InvoiceStatus.DRAFT: # type: ignore
         raise HTTPException(status_code=400, detail="Cannot email a draft invoice. Finalise it first.")
 
-    if invoice.status == "CANCELLED": # type: ignore
+    if invoice.status == InvoiceStatus.CANCELLED: # type: ignore
         raise HTTPException(status_code=400, detail="Cannot email a cancelled invoice.")
 
-    customer = db.query(Customer).filter(Customer.id == invoice.customer_id).first()
+    customer = invoice.customer # type: ignore 
     if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
+        raise HTTPException(status_code=404, detail="customer not found")
 
     customer_email = str(customer.email or "")
     customer_name  = str(customer.name  or "")
@@ -956,32 +844,35 @@ def send_invoice(
         pdf_buffer = generate_invoice_pdf(invoice, business, customer)
         pdf_bytes  = pdf_buffer.getvalue()
     except Exception as e:
-        logger.warning(f"PDF generation failed, sending without attachment: {e}")
+        logger.warning("PDF generation failed, sending without attachment: %s", e, exc_info=True)
         pdf_bytes = None
 
-    try:
-        send_invoice_email(
-            to_email       = customer_email,
-            customer_name  = customer_name,
-            invoice_number = str(invoice.invoice_number or ""),
-            invoice_date   = _fmt_date_str(invoice.issue_date),
-            due_date       = _fmt_date_str(invoice.due_date),
-            total_amount   = _fmt_ngn(invoice.total_amount),
-            business_name  = str(business.business_name or ""),
-            pdf_bytes      = pdf_bytes,
-            custom_message = body.message or None,
-            cc_email       = body.cc or None,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected email error: {e}")
-        raise HTTPException(status_code=502, detail="Email delivery failed. Check server logs.")
 
-    setattr(invoice, 'email_sent',    True)
-    setattr(invoice, 'email_sent_at', datetime.utcnow())
-    db.commit()
-    db.refresh(invoice)
+    
+    invoice.email_sent = True # type: ignore
+    invoice.email_sent_at = datetime.now(timezone.utc) # type: ignore
+
+    await db.commit()
+    await db.refresh(invoice)
+    
+    background_tasks.add_task(
+        send_invoice_email,
+        to_email=customer_email,
+        customer_name=customer_name,
+        invoice_number=str(invoice.invoice_number or ""),
+        invoice_date=_fmt_date_str(invoice.issue_date),
+        due_date=_fmt_date_str(invoice.due_date),
+        total_amount=_fmt_ngn(invoice.total_amount),
+        business_name=str(business.business_name or ""),
+        pdf_bytes=pdf_bytes,
+        custom_message=body.message or None,
+        cc_email=body.cc or None,
+        
+        
+        
+    )
+
+    logger.info("Invoice %s queued for email to %s", invoice.invoice_number, customer_email)
 
     return {
         "message":      f"Invoice {invoice.invoice_number} emailed to {customer_email}",
@@ -993,24 +884,160 @@ def send_invoice(
 
 
 @router.get("/{invoice_id}/email-status", status_code=status.HTTP_200_OK)
-def get_email_status(
+async def get_email_status(
     invoice_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Returns whether and when this invoice was last emailed."""
-    business = get_user_business(db, current_user.id) # type: ignore
+    business = await get_user_business(db, current_user.id) # type: ignore
 
-    invoice = db.query(Invoice).filter(
-        Invoice.id == invoice_id,
-        Invoice.business_id == business.id
-    ).first()
+    invoice = await get_invoice_by_id(db, invoice_id, business.id) # type: ignore
 
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+   
 
     return {
         "invoice_id":    str(invoice.id),
         "email_sent":    bool(invoice.email_sent),
         "email_sent_at": invoice.email_sent_at,
     }
+    
+    
+    
+@router.post("/", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
+async def create_invoice(
+    invoice_data: InvoiceCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+
+    try:
+        business = await get_user_business(db, current_user.id)  # type: ignore
+        customer = await verify_customer_belongs_to_business(
+            db, invoice_data.customer_id, business.id  # type: ignore
+        )
+
+        invoice_number = await generate_unique_invoice_number(db, business)
+        invoice = Invoice(
+            business_id=business.id,
+            customer_id=customer.id,
+            invoice_number=invoice_number,
+            issue_date=invoice_data.issue_date,
+            due_date=invoice_data.due_date,
+            discount_amount=invoice_data.discount_amount,
+            payment_terms=(
+                invoice_data.payment_terms
+                or f"Payment due within {customer.payment_terms_days} days"
+            ),
+            notes=invoice_data.notes,
+            internal_notes=invoice_data.internal_notes,
+            status=InvoiceStatus.DRAFT,
+        )
+        db.add(invoice)
+        try:
+            await db.flush()
+        except IntegrityError as e:
+            await db.rollback()
+            if "ix_invoices_invoice_number" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Invoice number {invoice_number} already exists. Please try again.",
+                )
+            raise
+
+            
+        for idx, item_data in enumerate(invoice_data.items):
+            item = InvoiceItem(
+                invoice_id=invoice.id,
+                product_id=item_data.product_id,
+                description=item_data.description,
+                quantity=item_data.quantity,
+                unit_price=item_data.unit_price,
+                discount_percent=item_data.discount_percent,
+                tax_rate=item_data.tax_rate,
+                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx,
+            )
+            item.calculate_totals()
+            db.add(item)
+            if item_data.product_id:
+                product_result = await db.execute(
+                    select(Product).where(Product.id == item_data.product_id)
+                )
+                product = product_result.scalar_one_or_none()
+                if product:
+                    product.increment_usage()
+                    if product.track_inventory:  # type: ignore
+                        if product.quantity_in_stock < item_data.quantity:  # type: ignore
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=(
+                                    f"Insufficient stock for '{product.name}'. "
+                                    f"Available: {product.quantity_in_stock}, "
+                                    f"requested: {item_data.quantity}"
+                                ),
+                            )
+
+                    
+                    
+                    try:
+                        await db.execute(
+                            text("""
+                                 INSERT INTO stock_movements
+                                 (id, business_id, product_id, invoice_id,
+                                 movement_type, quantity, unit_cost, note, movement_date)
+                                 VALUES
+                                 (gen_random_uuid(), :biz_id, :product_id, :invoice_id,
+                                 'OUT', :qty, :cost, :note, :dt)
+                                 """),
+                            {
+                                "biz_id": str(invoice.business_id),
+                                "product_id": str(product.id),
+                                "invoice_id": str(invoice.id),
+                                "qty": float(item_data.quantity),
+                                "cost": float(product.cost_price) if product.cost_price else None,  # type: ignore
+                                "note": "Sale - " + invoice.invoice_number,
+                                "dt": invoice.issue_date or date.today(),
+                            },
+                        )
+                        result = await db.execute(
+                            text("""
+                            SELECT
+                            COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END), 0)
+                            - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END), 0)
+                            FROM stock_movements
+                            WHERE product_id = :pid
+                            """),
+                            {"pid": str(product.id)},
+                        )
+                        new_qty = result.scalar()
+                        product.quantity_in_stock = max(float(new_qty or 0), 0)  # type: ignore
+
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.error(
+                            "Stock movement failed for product %s on invoice %s: %s",
+                            product.id,
+                            invoice.invoice_number,
+                            e,
+                            exc_info=True,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Failed to record stock movement for product '{product.name}'",
+                        )
+
+                    
+                            
+    
+    
+        await db.flush()
+        await db.refresh(invoice)
+        invoice.calculate_totals()
+        await db.commit()
+        await db.refresh(invoice)
+        return invoice
+
+    except HTTPException:
+        raise
+
