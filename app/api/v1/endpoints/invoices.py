@@ -1041,3 +1041,11 @@ async def create_invoice(
     except HTTPException:
         raise
 
+    except Exception as e:
+        await db.rollback()
+        logger.error("Error creating invoice: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create invoice"
+        )
+

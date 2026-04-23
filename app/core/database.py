@@ -61,7 +61,7 @@ else:  # development / test
 #
 
 async_engine   = create_async_engine(
-    settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://"),
+    settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql+asyncpg://"),
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,
     pool_timeout=POOL_TIMEOUT,
