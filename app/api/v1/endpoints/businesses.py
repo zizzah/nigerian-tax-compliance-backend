@@ -2,13 +2,15 @@
 Business API Endpoints
 Location: app/api/v1/endpoints/businesses.py
 """
+import asyncio
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
-from typing import Optional
-import uuid
-import os
-from pathlib import Path
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select
+
+
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -21,6 +23,21 @@ from app.schemas.business import (
     BusinessSummary
 )
 
+
+import cloudinary
+import cloudinary.uploader
+from app.core.encryption import encrypt
+
+from app.core.config import settings
+logger = logging.getLogger(__name__)
+# Configure Cloudinary — put this at the top of businesses.py
+cloudinary.config(
+    cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+    api_key=settings.CLOUDINARY_API_KEY,
+    api_secret=settings.CLOUDINARY_API_SECRET,
+    secure=True,  # always use HTTPS
+)
+
 router = APIRouter(prefix="/businesses", tags=["Businesses"])
 
 
@@ -28,51 +45,38 @@ router = APIRouter(prefix="/businesses", tags=["Businesses"])
 # Business Profile Endpoints
 # ============================================================================
 
+async def get_business_or_404(db: AsyncSession, user_id) -> Business:
+    result = await db.execute(select(Business).where(Business.user_id == user_id))
+    business = result.scalar_one_or_none()
+    if not business:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Business profile not found")
+    return business
+
 @router.post("/", response_model=BusinessResponse, status_code=status.HTTP_201_CREATED)
 async def create_business(
     business_data: BusinessCreate,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Create a business profile for the current user.
-    
-    - **business_name**: Required business name (2-255 chars)
-    - **business_type**: Optional (e.g., "Limited Liability Company")
-    - **industry**: Optional (e.g., "Technology", "Retail")
-    - **tin**: Optional Tax Identification Number
-    - **vat_registered**: Boolean indicating VAT registration status
-    
-    **Note**: Each user can only have one business profile.
-    """
-    # Check if user already has a business
-    existing_business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if existing_business:
+    result = await db.execute(select(Business).where(Business.user_id == current_user.id))
+    existing = result.scalar_one_or_none()
+
+    if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Business profile already exists. Use PATCH /businesses/me to update."
         )
-    
-    # Create new business
-    business = Business(
-        **business_data.model_dump(),
-        user_id=current_user.id
-    )
-    
-    db.add(business)
-    db.commit()
-    db.refresh(business)
-    
-    return business
 
+    business = Business(**business_data.model_dump(), user_id=current_user.id)
+    db.add(business)
+    await db.commit()
+    await db.refresh(business)
+    return business
 
 @router.get("/me", response_model=BusinessResponse)
 async def get_my_business(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Get the current user's business profile.
@@ -85,15 +89,7 @@ async def get_my_business(
     - Invoice settings
     - Subscription details
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found. Create one first at POST /businesses"
-        )
+    business = await get_business_or_404(db, current_user.id)
     
     return business
 
@@ -102,7 +98,7 @@ async def get_my_business(
 async def update_my_business(
     business_data: BusinessUpdate,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Update the current user's business profile.
@@ -116,23 +112,15 @@ async def update_my_business(
     - Branding (colors, logo)
     - Invoice settings (prefix)
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found. Create one first at POST /businesses"
-        )
+    business = await get_business_or_404(db, current_user.id)
     
     # Update only provided fields
     update_data = business_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(business, field, value)
     
-    db.commit()
-    db.refresh(business)
+    await db.commit()
+    await db.refresh(business)
     
     return business
 
@@ -140,7 +128,7 @@ async def update_my_business(
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_my_business(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Delete the current user's business profile.
@@ -153,18 +141,10 @@ async def delete_my_business(
     
     This action cannot be undone!
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
+    business = await get_business_or_404(db, current_user.id)
     
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found"
-        )
-    
-    db.delete(business)
-    db.commit()
+    await db.delete(business)
+    await db.commit()
     
     return None
 
@@ -172,22 +152,15 @@ async def delete_my_business(
 @router.get("/me/summary", response_model=BusinessSummary)
 async def get_business_summary(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Get a lightweight summary of the current user's business.
     
     Useful for displaying business info in headers, dashboards, etc.
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found"
-        )
+    business = await get_business_or_404(db, current_user.id)
+
     
     return business
 
@@ -200,69 +173,67 @@ async def get_business_summary(
 async def upload_business_logo(
     logo: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Upload a business logo.
-    
+    Upload a business logo to Cloudinary.
+
     - **Allowed formats**: PNG, JPG, JPEG
     - **Max size**: 5MB
     - **Recommended dimensions**: 500x500px square
-    
-    The logo will be stored and the URL will be saved to the business profile.
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found"
-        )
-    
+    business = await get_business_or_404(db, current_user.id)
+
     # Validate file type
     allowed_types = ["image/png", "image/jpeg", "image/jpg"]
     if logo.content_type not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid file type. Allowed: PNG, JPG, JPEG"
+            detail="Invalid file type. Allowed: PNG, JPG, JPEG"
         )
-    
-    # Validate file size (5MB)
-    file_size = 0
-    chunk_size = 1024 * 1024  # 1MB
-    for chunk in iter(lambda: logo.file.read(chunk_size), b""):
-        file_size += len(chunk)
-        if file_size > 5 * 1024 * 1024:  # 5MB
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File too large. Max size: 5MB"
-            )
-    
-    # Reset file pointer
-    logo.file.seek(0)
-    
-    # Create uploads directory if it doesn't exist
-    upload_dir = Path("uploads/logos")
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Generate unique filename
-    file_extension = logo.filename.split(".")[-1] # type: ignore
-    filename = f"{business.id}.{file_extension}"
-    file_path = upload_dir / filename
-    
-    # Save file
-    with open(file_path, "wb") as f:
-        f.write(logo.file.read())
-    
-    # Update business logo_url
-    business.logo_url = f"/uploads/logos/{filename}" # type: ignore
-    db.commit()
-    db.refresh(business)
-    
-    return business
 
+    # Read file into memory asynchronously
+    contents = await logo.read()
+
+    # Validate file size (5MB)
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File too large. Max size: 5MB"
+        )
+
+    # Upload to Cloudinary
+    # cloudinary.uploader.upload() is sync — run in threadpool to avoid blocking
+    try:
+        
+        result = await asyncio.get_running_loop().run_in_executor(
+            None,  # uses default threadpool
+            lambda: cloudinary.uploader.upload(
+                contents,
+                folder="business_logos",
+                public_id=str(business.id),  # use business ID as filename
+                overwrite=True,              # replace existing logo on re-upload
+                resource_type="image",
+                transformation=[
+                    {"width": 500, "height": 500, "crop": "limit"},  # resize to max 500x500
+                    {"quality": "auto"},                               # auto-optimise quality
+                    {"fetch_format": "auto"},                          # serve webp to browsers that support it
+                ]
+            )
+        )
+    except Exception as e:
+        logger.error("Cloudinary upload failed: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upload logo. Please try again."
+        )
+
+    # Save the Cloudinary URL to the business profile
+    business.logo_url = result["secure_url"]  # type: ignore
+    await db.commit()
+    await db.refresh(business)
+
+    return business
 
 # ============================================================================
 # Utility Endpoints
@@ -271,22 +242,14 @@ async def upload_business_logo(
 @router.get("/me/next-invoice-number")
 async def get_next_invoice_number(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Get the next invoice number that will be generated.
     
     Useful for previewing invoice numbers before creation.
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-    
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found"
-        )
+    business = await get_business_or_404(db, current_user.id)
     
     return {
         "next_invoice_number": business.get_next_invoice_number(),
@@ -307,30 +270,22 @@ class PaystackKeysRequest(BaseModel):
 async def save_paystack_keys(
     data: PaystackKeysRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Save Paystack API keys for this business.
     Each business on the platform has their own Paystack account and keys.
     Keys are stored per-business so payments go directly into each business's account.
     """
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
-
-    if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Business profile not found",
-        )
+    business = await get_business_or_404(db, current_user.id)
 
     if data.public_key:
-        setattr(business, "paystack_public_key", data.public_key)
+        business.paystack_public_key = data.public_key # type: ignore
     if data.secret_key:
-        setattr(business, "paystack_secret_key", data.secret_key)
+        business.paystack_secret_key = encrypt(data.secret_key)  # type: ignore # Encrypt secret key before saving
 
-    db.commit()
-    db.refresh(business)
+    await db.commit()
+    await db.refresh(business)
 
     return {
         "message": "Paystack keys saved successfully",
@@ -342,16 +297,12 @@ async def save_paystack_keys(
 @router.get("/me/paystack/status", status_code=status.HTTP_200_OK)
 async def get_paystack_status(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """Check whether this business has Paystack keys configured."""
-    business = db.query(Business).filter(
-        Business.user_id == current_user.id
-    ).first()
+    business = await get_business_or_404(db, current_user.id)
 
-    if not business:
-        raise HTTPException(status_code=404, detail="Business profile not found")
-
+    
     return {
         "has_public_key": bool(getattr(business, "paystack_public_key", None)),
         "has_secret_key": bool(getattr(business, "paystack_secret_key", None)),

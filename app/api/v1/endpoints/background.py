@@ -6,7 +6,8 @@ Downloads the file from Cloudinary URL, runs OCR + Groq extraction,
 saves results back to the document record.
 """
 from fastapi import APIRouter, Request, HTTPException, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.document import Document, ProcessingStatus
@@ -68,7 +69,7 @@ def verify_qstash_signature(request: Request, body: bytes) -> bool:
 
 
 @router.post("/process-document")
-async def process_document(request: Request, db: Session = Depends(get_db)):
+async def process_document(request: Request, db: AsyncSession = Depends(get_db)):
     """
     QStash callback: download file from Cloudinary, run OCR + Groq, save results.
     """
@@ -83,29 +84,28 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
     if not document_id:
         raise HTTPException(status_code=400, detail="document_id is required")
 
-    logger.info(f"Processing document: {document_id}")
+    logger.info("Processing document: %s", document_id)
 
     document = None
     tmp_path = None
 
     try:
-        document = db.query(Document).filter(
-            Document.id == uuid.UUID(document_id)
-        ).first()
+        result = await db.execute(select(Document).where(Document.id == uuid.UUID(document_id)))
+        document = result.scalars().first()
 
         if not document:
             raise ValueError(f"Document {document_id} not found")
 
         document.status = ProcessingStatus.PROCESSING # type: ignore
         document.processing_started_at = datetime.now(timezone.utc) # type: ignore
-        db.commit()
+        await db.commit()
 
         start_time = time.time()
 
         # ── Download from Cloudinary ──────────────────────────────────────────
         # document.file_path is the Cloudinary secure URL
         cloudinary_url = document.file_path
-        logger.info(f"Downloading from Cloudinary: {cloudinary_url}")
+        logger.info("Downloading from Cloudinary: %s", cloudinary_url)
 
         ext = _ext_from_mimetype(document.file_type) # type: ignore
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
@@ -131,7 +131,7 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
 
         document.ocr_raw_text  = ocr_text # type: ignore
         document.ocr_confidence = ocr_confidence # type: ignore
-        db.commit()
+        await db.commit()
 
         if not ocr_text or len(ocr_text.strip()) < 10:
             raise ValueError("OCR extracted no meaningful text")
@@ -188,13 +188,14 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
         document.processing_completed_at    = datetime.now(timezone.utc) # type: ignore
         document.processing_duration_seconds = processing_duration # type: ignore
 
-        db.commit()
+        await db.commit()
 
         logger.info(
-            f"✅ Processed: {document.original_filename} | "
-            f"Vendor: {document.vendor_name} | "
-            f"Total: ₦{float(document.total_amount):,.2f} | "
-            f"Time: {processing_duration:.2f}s"
+            "Processed: %s | Vendor: %s | Total: NGN %.2f | Time: %.2fs",
+            document.original_filename,
+            document.vendor_name,
+            float(document.total_amount),
+            processing_duration
         )
 
         return {
@@ -205,9 +206,13 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
             "confidence_score": float(document.confidence_score) if document.confidence_score else None, # type: ignore
             "processing_time":  processing_duration,
         }
+    
+    except HTTPException:
+        raise
+        
 
     except Exception as e:
-        logger.error(f"Document processing failed: {e}", exc_info=True)
+        logger.error("Document processing failed: %s", e, exc_info=True)
 
         if document:
             document.status = ProcessingStatus.FAILED # type: ignore
@@ -219,9 +224,9 @@ async def process_document(request: Request, db: Session = Depends(get_db)):
                     datetime.now(timezone.utc) - document.processing_started_at
                 ).total_seconds()
 
-            db.commit()
+            await db.commit()
 
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Document processing failed")
 
     finally:
         # Always clean up the temp file
