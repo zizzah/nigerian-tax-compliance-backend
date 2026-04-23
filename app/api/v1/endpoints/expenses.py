@@ -21,9 +21,14 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 from decimal import Decimal
+from sqlalchemy import cast, Float as SAFloat, distinct
+from sqlalchemy import text
+from datetime import timezone
+
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
+from sqlalchemy import select
 from sqlalchemy import func, extract, and_
 from pydantic import BaseModel, Field
 
@@ -33,7 +38,7 @@ from app.models.user import User
 from app.models.business import Business
 from app.models.expense import Expense, ExpenseCategory, ExpensePaymentMethod
 from app.models.expense import CATEGORY_LABELS, TAX_DEDUCTIBLE, CATEGORY_GROUPS
-from app.models.invoice import Invoice
+from app.models.invoice import Invoice, InvoiceStatus
 from app.models.invoice_item import InvoiceItem
 from app.models.product import Product
 from app.models.payment import Payment
@@ -44,8 +49,9 @@ router = APIRouter(prefix="/expenses", tags=["Expenses"])
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_business(db: Session, user: User) -> Business:
-    biz = db.query(Business).filter(Business.user_id == user.id).first()
+async def _get_business(db: AsyncSession, user: User) -> Business:
+    result =await  db.execute(select(Business).where(Business.user_id == user.id))
+    biz = result.scalar_one_or_none()
     if not biz:
         raise HTTPException(status_code=404, detail="Business profile not found")
     return biz
@@ -134,7 +140,7 @@ def _serialize(e: Expense) -> dict:
 # ── GET /expenses/ ────────────────────────────────────────────────────────────
 
 @router.get("/")
-def list_expenses(
+async def list_expenses(
     page:      int            = Query(1, ge=1),
     page_size: int            = Query(50, ge=1, le=100),
     category:  Optional[str]  = Query(None),
@@ -143,37 +149,44 @@ def list_expenses(
     year:      Optional[int]  = Query(None),
     month:     Optional[int]  = Query(None, ge=1, le=12),
     search:    Optional[str]  = Query(None),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
-    q   = db.query(Expense).filter(Expense.business_id == biz.id)
+    biz = await  _get_business(db, current_user)
+    q   = select(Expense).where(Expense.business_id == biz.id)
 
     if category:
         try:
-            q = q.filter(Expense.category == ExpenseCategory(category))
+            q = q.where(Expense.category == ExpenseCategory(category))
         except ValueError:
             pass
     if from_date:
-        q = q.filter(Expense.expense_date >= from_date)
+        q = q.where(Expense.expense_date >= from_date)
     if to_date:
-        q = q.filter(Expense.expense_date <= to_date)
+        q = q.where(Expense.expense_date <= to_date)
     if year:
-        q = q.filter(extract("year", Expense.expense_date) == year)
+        q = q.where(extract("year", Expense.expense_date) == year)
     if month:
-        q = q.filter(extract("month", Expense.expense_date) == month)
+        q = q.where(extract("month", Expense.expense_date) == month)
     if search:
         like = f"%{search}%"
-        q = q.filter(
+        q = q.where(
             Expense.description.ilike(like) |
             Expense.vendor_name.ilike(like) |
             Expense.reference_number.ilike(like)
         )
 
-    total       = q.count()
-    total_pages = math.ceil(total / page_size)
-    offset      = (page - 1) * page_size
-    expenses    = q.order_by(Expense.expense_date.desc()).offset(offset).limit(page_size).all()
+    count_result = await db.execute(select(func.count()).select_from(q.subquery()))
+    total = count_result.scalar()
+    total_pages = math.ceil(total / page_size) # type: ignore
+    offset = (page - 1) * page_size
+    result =await db.execute(
+        q.order_by(Expense.expense_date.desc()).offset(offset).limit(page_size)
+
+        
+    )
+    expenses = result.scalars().all()
+
 
     return {
         "expenses":    [_serialize(e) for e in expenses],
@@ -187,12 +200,12 @@ def list_expenses(
 # ── POST /expenses/ ───────────────────────────────────────────────────────────
 
 @router.post("/", status_code=201)
-def create_expense(
+async def create_expense(
     data: ExpenseCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
+    biz =await  _get_business(db, current_user)
 
     try:
         cat = ExpenseCategory(data.category)
@@ -214,38 +227,48 @@ def create_expense(
     if data.is_recurring and data.recurrence_period:
         next_due = _next_due(data.recurrence_period, data.expense_date)
 
-    expense = Expense(
-        id=uuid.uuid4(),
-        business_id=biz.id,
-        category=cat,
-        subcategory=data.subcategory,
-        description=data.description,
-        amount=Decimal(str(data.amount)),
-        expense_date=data.expense_date,
-        vendor_name=data.vendor_name,
-        reference_number=data.reference_number,
-        payment_method=pm,
-        is_tax_deductible=is_deductible,
-        tax_year=data.expense_date.year,
-        is_recurring=data.is_recurring,
-        recurrence_period=data.recurrence_period,
-        next_due_date=next_due,
-        receipt_url=data.receipt_url,
-        notes=data.notes,
-    )
-    db.add(expense)
-    db.commit()
-    db.refresh(expense)
-    return _serialize(expense)
+    try:
+        expense = Expense(
+            id=uuid.uuid4(),
+            business_id=biz.id,
+            category=cat,
+            subcategory=data.subcategory,
+            description=data.description,
+            amount=Decimal(str(data.amount)),
+            expense_date=data.expense_date,
+            vendor_name=data.vendor_name,
+            reference_number=data.reference_number,
+            payment_method=pm,
+            is_tax_deductible=is_deductible,
+            tax_year=data.expense_date.year,
+            is_recurring=data.is_recurring,
+            recurrence_period=data.recurrence_period,
+            next_due_date=next_due,
+            receipt_url=data.receipt_url,
+            notes=data.notes,
+        )
+        db.add(expense)
+        await db.commit()
+        await db.refresh(expense)
+        return _serialize(expense)
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Database error in create_expense: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
 
 
 # ── GET /expenses/summary ─────────────────────────────────────────────────────
 
 @router.get("/summary")
-def get_summary(
+async def get_summary(
     year:  int           = Query(default_factory=lambda: date.today().year),
     month: Optional[int] = Query(None, ge=1, le=12),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
@@ -258,23 +281,20 @@ def get_summary(
     - YTD totals
     - Tax-deductible total
     """
-    biz = _get_business(db, current_user)
+    biz =await  _get_business(db, current_user)
     today = date.today()
 
     # ── Expense totals by category for the year ──────────────────────────────
-    cat_rows = (
-        db.query(
+    cat_rows = await db.execute(
+        select(
             Expense.category,
             func.sum(Expense.amount).label("total"),
             func.count(Expense.id).label("count"),
-        )
-        .filter(
-            Expense.business_id == biz.id,
-            extract("year", Expense.expense_date) == year,
-        )
-        .group_by(Expense.category)
-        .all()
+
+        ).where(Expense.business_id == biz.id,extract("year", Expense.expense_date) == year,).group_by(Expense.category)
     )
+    
+    cat_rows = cat_rows.all()
 
     by_category = {}
     total_expenses = 0.0
@@ -305,33 +325,35 @@ def get_summary(
             })
 
     # ── Monthly expense totals for the year ──────────────────────────────────
-    month_rows = (
-        db.query(
-            extract("month", Expense.expense_date).label("mo"),
+    month_rows = await(
+        db.execute(
+            select(extract("month", Expense.expense_date).label("mo"),
             func.sum(Expense.amount).label("total"),
         )
-        .filter(
+        .where(
             Expense.business_id == biz.id,
             extract("year", Expense.expense_date) == year,
-        )
-        .group_by("mo")
-        .all()
+        ).group_by("mo"))
+        
+
     )
     monthly_expenses = {int(r.mo): float(r.total or 0) for r in month_rows}
 
     # ── Monthly revenue (from payments) ──────────────────────────────────────
     rev_rows = (
-        db.query(
-            extract("month", Payment.payment_date).label("mo"),
+        await db.execute(
+            select(extract("month", Payment.payment_date).label("mo"),
             func.sum(Payment.amount).label("total"),
         )
-        .filter(
+        .where(
             Payment.business_id == biz.id,
             extract("year", Payment.payment_date) == year,
-        )
-        .group_by("mo")
-        .all()
+        ).group_by("mo"))
+        
+        
     )
+    
+    rev_rows = rev_rows.all()
     monthly_revenue = {int(r.mo): float(r.total or 0) for r in rev_rows}
 
     month_names = ["Jan","Feb","Mar","Apr","May","Jun",
@@ -352,33 +374,36 @@ def get_summary(
         })
 
     # ── YTD Revenue (cash collected) ─────────────────────────────────────────
-    ytd_revenue = float(
-        db.query(func.sum(Payment.amount))
-        .filter(
+    result = (
+        await db.execute(select(func.sum(Payment.amount))
+        .where(
             Payment.business_id == biz.id,
             extract("year", Payment.payment_date) == year,
             Payment.payment_date <= today,
-        )
-        .scalar() or 0
+        ))
+        
     )
+    
+    ytd_revenue = float(result.scalar() or 0)
 
     # ── YTD Revenue from invoices (accrual — total invoiced) ─────────────────
     # Use all non-cancelled, non-draft invoices for the year
     # Filter by string values to avoid enum mismatch issues
-    from app.models.invoice import InvoiceStatus as IS
     active_statuses = [
-        IS.SENT, IS.PAID, IS.OVERDUE, IS.PARTIALLY_PAID
+        InvoiceStatus.SENT, InvoiceStatus.PAID, InvoiceStatus.OVERDUE, InvoiceStatus.PARTIALLY_PAID
     ]
-    ytd_invoiced = float(
-        db.query(func.sum(Invoice.total_amount))
-        .filter(
+    result = (
+        await db.execute(select(func.sum(Invoice.total_amount))
+        .where(
             Invoice.business_id == biz.id,
             extract("year", Invoice.issue_date) == year,
             Invoice.status.in_(active_statuses), # type: ignore
-        )
-        .scalar() or 0
+        ))
+        
     )
+    
     # Fallback: if invoice query returns 0 but we have cash revenue, use cash
+    ytd_invoiced =float(result.scalar() or 0)
     if ytd_invoiced == 0 and ytd_revenue > 0:
         ytd_invoiced = ytd_revenue
 
@@ -388,10 +413,9 @@ def get_summary(
     ytd_start = date(year, 1, 1)
     ytd_end   = today if today.year == year else date(year, 12, 31)
 
-    from sqlalchemy import cast, Float as SAFloat, distinct
     cogs_rows = (
-        db.query(
-            func.sum(
+        await db.execute(
+            select(func.sum(
                 cast(InvoiceItem.quantity, SAFloat) *
                 cast(Product.cost_price, SAFloat)
             ).label("cogs")
@@ -399,23 +423,24 @@ def get_summary(
         .join(Invoice, InvoiceItem.invoice_id == Invoice.id)
         .join(Product, InvoiceItem.product_id == Product.id)
         .join(Payment, Payment.invoice_id == Invoice.id)
-        .filter(
+        .where(
             Invoice.business_id == biz.id,
             Payment.business_id == biz.id,
             Payment.payment_date >= ytd_start,
             Payment.payment_date <= ytd_end,
             Product.cost_price.isnot(None),
             Product.cost_price > 0,
-        )
-        .first()
+        ))
+        
     )
-    cogs_ytd = float(cogs_rows.cogs or 0) if cogs_rows and cogs_rows.cogs else 0.0
+    cogs_rows = cogs_rows.scalar_one_or_none()
+    cogs_ytd = float(cogs_rows or 0)
 
     # ── Fallback COGS via raw SQL if join returns 0 ───────────────────────────
     if cogs_ytd == 0:
         try:
-            raw_cogs = db.execute(
-                __import__('sqlalchemy').text("""
+            result =await  db.execute(
+                text("""
                     SELECT COALESCE(SUM(CAST(ii.quantity AS FLOAT) * CAST(p.cost_price AS FLOAT)), 0)
                     FROM invoice_items ii
                     JOIN invoices i ON ii.invoice_id = i.id
@@ -429,8 +454,8 @@ def get_summary(
                       AND p.cost_price > 0
                 """),
                 {"biz_id": str(biz.id), "start_date": ytd_start, "end_date": ytd_end}
-            ).scalar()
-            cogs_ytd = float(raw_cogs or 0)
+            )
+            cogs_ytd = float(result.scalar() or 0)
         except Exception:
             cogs_ytd = 0.0
 
@@ -482,18 +507,17 @@ def get_summary(
 
     # ── Recurring expenses due soon (next 30 days) ───────────────────────────
     in_30 = today + timedelta(days=30)
-    due_soon = (
-        db.query(Expense)
-        .filter(
+    due_soon_result = (
+        await db.execute(select(Expense)
+        .where(
             Expense.business_id == biz.id,
             Expense.is_recurring == True,  # noqa: E712
             Expense.next_due_date <= in_30,
             Expense.next_due_date >= today,
-        )
-        .order_by(Expense.next_due_date)
-        .limit(5)
-        .all()
+        ).order_by(Expense.next_due_date).limit(5))  
     )
+    
+    due_soon = due_soon_result.scalars().all()
 
     return {
         "year":              year,
@@ -520,27 +544,28 @@ def get_summary(
         "by_category":       by_category,
         "groups":            groups,
         "monthly":           monthly,
-        "due_soon":          [_serialize(e) for e in due_soon],
+        "due_soon":          [_serialize(e) for e in due_soon], 
     }
 
 
 # ── GET /expenses/recurring ───────────────────────────────────────────────────
 
 @router.get("/recurring")
-def list_recurring(
-    db: Session = Depends(get_db),
+async def list_recurring(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
+    biz = await  _get_business(db, current_user)
     expenses = (
-        db.query(Expense)
-        .filter(
+        await db.execute(select(Expense)
+        .where(
             Expense.business_id == biz.id,
             Expense.is_recurring == True,  # noqa: E712
         )
         .order_by(Expense.next_due_date)
-        .all()
     )
+    )
+    expenses = expenses.scalars().all()
     today  = date.today()
     result = []
     for e in expenses:
@@ -554,16 +579,18 @@ def list_recurring(
 # ── GET /expenses/{id} ────────────────────────────────────────────────────────
 
 @router.get("/{expense_id}")
-def get_expense(
+async def get_expense(
     expense_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
-    e = db.query(Expense).filter(
+    biz =await _get_business(db, current_user)
+    e =await  db.execute(select(Expense).where(
         Expense.id == expense_id,
         Expense.business_id == biz.id,
-    ).first()
+    ))
+    
+    e= e.scalar_one_or_none()
     if not e:
         raise HTTPException(status_code=404, detail="Expense not found")
     return _serialize(e)
@@ -572,17 +599,18 @@ def get_expense(
 # ── PATCH /expenses/{id} ──────────────────────────────────────────────────────
 
 @router.patch("/{expense_id}")
-def update_expense(
+async def update_expense(
     expense_id: uuid.UUID,
     data: ExpenseUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
-    e = db.query(Expense).filter(
+    biz =await  _get_business(db, current_user)
+    e =await  db.execute(select(Expense).where(
         Expense.id == expense_id,
         Expense.business_id == biz.id,
-    ).first()
+    ))
+    e = e.scalar_one_or_none()
     if not e:
         raise HTTPException(status_code=404, detail="Expense not found")
 
@@ -617,27 +645,47 @@ def update_expense(
     for field, value in update.items():
         setattr(e, field, value)
 
-    e.updated_at = datetime.utcnow()  # type: ignore
-    db.commit()
-    db.refresh(e)
-    return _serialize(e)
+    try:
+        e.updated_at = datetime.now(timezone.utc)  # type: ignore
+        await db.commit()
+        await db.refresh(e)
+        return _serialize(e)
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Database error in update_expense: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
 
 
 # ── DELETE /expenses/{id} ─────────────────────────────────────────────────────
 
 @router.delete("/{expense_id}", status_code=204)
-def delete_expense(
+async def delete_expense(
     expense_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = _get_business(db, current_user)
-    e = db.query(Expense).filter(
+    biz = await _get_business(db, current_user)
+    e =await db.execute(select(Expense).where(
         Expense.id == expense_id,
         Expense.business_id == biz.id,
-    ).first()
+    ))
+    e = e.scalar_one_or_none()
     if not e:
         raise HTTPException(status_code=404, detail="Expense not found")
-    db.delete(e)
-    db.commit()
-    return None
+    try:
+        await db.delete(e)
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Database error in delete_expense: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
