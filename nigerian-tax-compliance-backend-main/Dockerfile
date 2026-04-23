@@ -24,7 +24,7 @@ COPY . .
 RUN mkdir -p uploads/documents uploads/logos
 
 # Copy and make startup script executable
-COPY start.sh .
+
 RUN chmod +x start.sh
 
 EXPOSE 8000
