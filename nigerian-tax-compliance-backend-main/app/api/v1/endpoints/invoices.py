@@ -440,118 +440,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
 # INVOICE CRUD ENDPOINTS (keeping existing code)
 # ============================================================================
 
-@router.post("/", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
-async def create_invoice(
-    invoice_data: InvoiceCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Create a new invoice with improved error handling"""
-    try:
-        business = await get_user_business(db, current_user.id) # type: ignore
-        customer = await verify_customer_belongs_to_business(db, invoice_data.customer_id, business.id) # type: ignore
-        invoice_number = await generate_unique_invoice_number(db, business)
-        
-        invoice = Invoice(
-            business_id=business.id,
-            customer_id=customer.id,
-            invoice_number=invoice_number,
-            issue_date=invoice_data.issue_date,
-            due_date=invoice_data.due_date,
-            discount_amount=invoice_data.discount_amount,
-            payment_terms=invoice_data.payment_terms or f"Payment due within {customer.payment_terms_days} days",
-            notes=invoice_data.notes,
-            internal_notes=invoice_data.internal_notes,
-            status=InvoiceStatus.DRAFT
-        )
-        
-        db.add(invoice)
-        
-        try:
-            await db.flush()
-        except IntegrityError as e:
-            await db.rollback()
-            if "ix_invoices_invoice_number" in str(e):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Invoice number {invoice_number} already exists. Please try again."
-                )
-            raise
-        
-        for idx, item_data in enumerate(invoice_data.items):
-            item = InvoiceItem(
-                invoice_id=invoice.id,
-                product_id=item_data.product_id,
-                description=item_data.description,
-                quantity=item_data.quantity,
-                unit_price=item_data.unit_price,
-                discount_percent=item_data.discount_percent,
-                tax_rate=item_data.tax_rate,
-                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx
-            )
-            
-            item.calculate_totals()
-            db.add(item)
-            
-            if item_data.product_id:
-                product = await db.execute(select(Product).where(Product.id == item_data.product_id))
-                product = product.scalar_one_or_none()
-                if product:
-                    product.increment_usage()
-                    # Record stock OUT movement for inventory tracking
-                    if product.track_inventory: # type: ignore
-                        try:
-                            await db.execute(text("""
-                                INSERT INTO stock_movements
-                                    (id, business_id, product_id, invoice_id,
-                                     movement_type, quantity, unit_cost, note, movement_date)
-                                VALUES
-                                    (gen_random_uuid(), :biz_id, :product_id, :invoice_id,
-                                     'OUT', :qty, :cost, :note, :dt)
-                            """), {
-                                "biz_id":     str(invoice.business_id),
-                                "product_id": str(product.id),
-                                "invoice_id": str(invoice.id),
-                                "qty":        float(item_data.quantity),
-                                "cost":       float(product.cost_price) if product.cost_price else None, # type: ignore
-                                "note":       "Sale - " + invoice.invoice_number,
-                                "dt":         invoice.issue_date or date.today(),
-                            })
-                            # Sync available stock on product
-                            result = await db.execute(text("""
-                                SELECT
-                                    COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END),0)
-                                  - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END),0)
-                                FROM stock_movements
-                                WHERE product_id = :pid
-                            """), {"pid": str(product.id)})
-                            new_qty = result.scalar()
-                            product.quantity_in_stock = float(new_qty or 0) # type: ignore
-                        except Exception as e: 
-                            logger.error(
-                                "Stock movement failed for product %s on invoice %s: %s",
-                                product.id, invoice.invoice_number, e, exc_info=True
-                            )
-        
-        await db.flush()
-        await db.refresh(invoice)
-        invoice.calculate_totals()
-        
-        
-        await db.commit()
-        await db.refresh(invoice)
-        
-        return invoice
-        
-    except HTTPException:
-        await db.rollback()
-        raise
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create invoice"
-        )
+
 
 
 @router.get("/", response_model=InvoiceListResponse)
@@ -1012,3 +901,143 @@ async def get_email_status(
         "email_sent":    bool(invoice.email_sent),
         "email_sent_at": invoice.email_sent_at,
     }
+    
+    
+    
+@router.post("/", response_model=InvoiceResponse, status_code=status.HTTP_201_CREATED)
+async def create_invoice(
+    invoice_data: InvoiceCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+
+    try:
+        business = await get_user_business(db, current_user.id)  # type: ignore
+        customer = await verify_customer_belongs_to_business(
+            db, invoice_data.customer_id, business.id  # type: ignore
+        )
+
+        invoice_number = await generate_unique_invoice_number(db, business)
+        invoice = Invoice(
+            business_id=business.id,
+            customer_id=customer.id,
+            invoice_number=invoice_number,
+            issue_date=invoice_data.issue_date,
+            due_date=invoice_data.due_date,
+            discount_amount=invoice_data.discount_amount,
+            payment_terms=(
+                invoice_data.payment_terms
+                or f"Payment due within {customer.payment_terms_days} days"
+            ),
+            notes=invoice_data.notes,
+            internal_notes=invoice_data.internal_notes,
+            status=InvoiceStatus.DRAFT,
+        )
+        db.add(invoice)
+        try:
+            await db.flush()
+        except IntegrityError as e:
+            await db.rollback()
+            if "ix_invoices_invoice_number" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Invoice number {invoice_number} already exists. Please try again.",
+                )
+            raise
+
+            
+        for idx, item_data in enumerate(invoice_data.items):
+            item = InvoiceItem(
+                invoice_id=invoice.id,
+                product_id=item_data.product_id,
+                description=item_data.description,
+                quantity=item_data.quantity,
+                unit_price=item_data.unit_price,
+                discount_percent=item_data.discount_percent,
+                tax_rate=item_data.tax_rate,
+                sort_order=item_data.sort_order if item_data.sort_order > 0 else idx,
+            )
+            item.calculate_totals()
+            db.add(item)
+            if item_data.product_id:
+                product_result = await db.execute(
+                    select(Product).where(Product.id == item_data.product_id)
+                )
+                product = product_result.scalar_one_or_none()
+                if product:
+                    product.increment_usage()
+                    if product.track_inventory:  # type: ignore
+                        if product.quantity_in_stock < item_data.quantity:  # type: ignore
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=(
+                                    f"Insufficient stock for '{product.name}'. "
+                                    f"Available: {product.quantity_in_stock}, "
+                                    f"requested: {item_data.quantity}"
+                                ),
+                            )
+
+                    
+                    
+                    try:
+                        await db.execute(
+                            text("""
+                                 INSERT INTO stock_movements
+                                 (id, business_id, product_id, invoice_id,
+                                 movement_type, quantity, unit_cost, note, movement_date)
+                                 VALUES
+                                 (gen_random_uuid(), :biz_id, :product_id, :invoice_id,
+                                 'OUT', :qty, :cost, :note, :dt)
+                                 """),
+                            {
+                                "biz_id": str(invoice.business_id),
+                                "product_id": str(product.id),
+                                "invoice_id": str(invoice.id),
+                                "qty": float(item_data.quantity),
+                                "cost": float(product.cost_price) if product.cost_price else None,  # type: ignore
+                                "note": "Sale - " + invoice.invoice_number,
+                                "dt": invoice.issue_date or date.today(),
+                            },
+                        )
+                        result = await db.execute(
+                            text("""
+                            SELECT
+                            COALESCE(SUM(CASE WHEN movement_type='IN'  THEN quantity ELSE 0 END), 0)
+                            - COALESCE(SUM(CASE WHEN movement_type='OUT' THEN quantity ELSE 0 END), 0)
+                            FROM stock_movements
+                            WHERE product_id = :pid
+                            """),
+                            {"pid": str(product.id)},
+                        )
+                        new_qty = result.scalar()
+                        product.quantity_in_stock = max(float(new_qty or 0), 0)  # type: ignore
+
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.error(
+                            "Stock movement failed for product %s on invoice %s: %s",
+                            product.id,
+                            invoice.invoice_number,
+                            e,
+                            exc_info=True,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Failed to record stock movement for product '{product.name}'",
+                        )
+
+                    
+                            
+    
+    
+        await db.flush()
+        await db.refresh(invoice)
+        invoice.calculate_totals()
+        await db.commit()
+        await db.refresh(invoice)
+        return invoice
+
+    except HTTPException:
+        raise
+

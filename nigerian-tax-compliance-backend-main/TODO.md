@@ -1,23 +1,11 @@
-# Products.py Fixes - Implementation Steps
+# Invoice Indentation Fix Plan
 
-## TODO (6/6 complete) ✅
+## Steps:
+- [x] Step 1: Apply indentation fixes to app/api/v1/endpoints/invoices.py using edit_file
+- [x] Step 2: Verify file syntax with python -c "import app.api.v1.endpoints.invoices"
+- [x] Step 3: Run test_all_endpoints.py (note: live API test, may skip if no data)
+- [x] Step 4: Run pytest on app/tests if applicable
+- [x] Step 5: Attempt completion
 
-- [x] 1. Add logger import and logger instance at module top
-- [x] 2. Add InvoiceItem import for usage count query
-- [x] 3. Fix create_product: Add general try/except Exception around DB ops
-- [x] 4. Fix update_product: Add general try/except Exception around DB ops  
-- [x] 5. Fix delete_product: Add full try/except Exception block
-- [x] 6. Fix permanently_delete_product: Replace usage_count with live InvoiceItem query + add try/except
-
-## All fixes complete!
-
-**Test:** Restart server (`uvicorn app.main:app --reload`) and test all product endpoints.
-
-## Testing
-- Restart server: `uvicorn app.main:app --reload`
-- Test all 4 endpoints with valid/invalid data
-- Force DB error if needed to test exception handling
-- Verify logs show logger usage
-
-**Next:** After all ✓, run `attempt_completion`
+Current progress: All steps complete. Indentation fixed and tests confirmed no syntax errors.
 
