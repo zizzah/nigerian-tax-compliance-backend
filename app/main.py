@@ -21,6 +21,9 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+
+
 
 # ── FastAPI / Starlette ──────────────────────────────────────────────────────
 from fastapi import Depends, FastAPI
@@ -33,7 +36,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession # type: ignore
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -41,7 +44,6 @@ from starlette.requests import Request
 # ── App internals ────────────────────────────────────────────────────────────
 from app.core.config import settings
 from app.core.database import (
-    check_database_connection,
     close_db_connections,
     get_db,
 )
@@ -117,23 +119,37 @@ else:
 # ============================================================================
 
 
-class RequestTimingMiddleware(BaseHTTPMiddleware):
-    """Attach X-Process-Time header; warn on requests > 1 s."""
 
-    async def dispatch(self, request: Request, call_next):
+class RequestTimingMiddleware:
+    """Pure ASGI middleware — no BaseHTTPMiddleware buffering overhead."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         start = time.time()
-        response = await call_next(request)
-        elapsed = time.time() - start
-        response.headers["X-Process-Time"] = f"{elapsed:.4f}"
-        if elapsed > 1.0:
-            logger.warning(
-                "Slow request: %s %s took %.2fs",
-                request.method,
-                request.url.path,
-                elapsed,
-            )
-        return response
 
+        async def send_with_timing(message) -> None:
+            if message["type"] == "http.response.start":
+                elapsed = time.time() - start
+                headers = list(message.get("headers", []))
+                headers.append(
+                    (b"x-process-time", f"{elapsed:.4f}".encode())
+                )
+                message = {**message, "headers": headers}
+                if elapsed > 1.0:
+                    logger.warning(
+                        "Slow request: %s took %.2fs",
+                        scope.get("path", "unknown"),
+                        elapsed,
+                    )
+            await send(message)
+
+        await self.app(scope, receive, send_with_timing)
 
 class TimeoutMiddleware(BaseHTTPMiddleware):
     """Return 504 if a handler takes longer than *timeout* seconds."""
@@ -167,10 +183,19 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 _is_production = settings.ENVIRONMENT == "production"
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up...")
+    yield
+    logger.info("Shutting down — disposing DB engine...")
+    await close_db_connections()
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     debug=settings.DEBUG,
+    lifespan=lifespan,
     # ── CHANGE 1: Hide API docs in production ──────────────────────────────
     # Exposing /docs in production leaks your entire API surface to attackers.
     docs_url=None if _is_production else "/docs",
@@ -321,7 +346,6 @@ def root():
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "status": "operational",
-        "environment": settings.ENVIRONMENT,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "documentation": "/docs" if not _is_production else "disabled in production",
         "endpoints": {
@@ -340,12 +364,7 @@ def alive():
 
 
 @app.get("/health", tags=["System"])
-def health_check(db: Session = Depends(get_db)):
-    """
-    Load-balancer health check.
-
-    Returns 200 when the database is reachable, 503 otherwise.
-    """
+async def health_check(db: AsyncSession = Depends(get_db)):
     health: dict = {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -353,22 +372,21 @@ def health_check(db: Session = Depends(get_db)):
         "version": settings.APP_VERSION,
         "environment": settings.ENVIRONMENT,
     }
-
-    if check_database_connection():
+    try:
+        await db.execute(text("SELECT 1"))
         health["checks"]["database"] = {"status": "healthy"}
-    else:
+    except Exception as exc:
+        logger.error("Health check DB failure: %s", exc)
         health["status"] = "unhealthy"
         health["checks"]["database"] = {
             "status": "unhealthy",
             "message": "Database connection failed",
         }
         return JSONResponse(status_code=503, content=health)
-
     return health
 
-
 @app.get("/ready", tags=["System"])
-def readiness_check(db: Session = Depends(get_db)):
+async def readiness_check(db: AsyncSession = Depends(get_db)):
     """
     Kubernetes readiness probe.
 
@@ -376,7 +394,7 @@ def readiness_check(db: Session = Depends(get_db)):
     balancer stops sending traffic to this instance.
     """
     try:
-        db.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
         return {"ready": True, "timestamp": datetime.now(timezone.utc).isoformat()}
     except Exception as exc:
         logger.error("Readiness check failed: %s", exc)
@@ -384,21 +402,25 @@ def readiness_check(db: Session = Depends(get_db)):
             status_code=503,
             content={
                 "ready": False,
-                "error": str(exc)[:200],
+                "error": "Database unavailable",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
 
 @app.get("/pool-status", tags=["System"])
-def pool_status():
+async def pool_status():
     """Real-time DB connection-pool statistics (for ops monitoring)."""
     from app.core.database import get_pool_status
+    if _is_production:
+        return JSONResponse(status_code=404, content={})
+        
+        
 
     try:
         return {
             "status": "healthy",
-            "pool": get_pool_status(),
+            "pool": await get_pool_status(),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as exc:
@@ -407,19 +429,9 @@ def pool_status():
             status_code=500,
             content={
                 "status": "error",
-                "error": str(exc),
+                "error": "Could not retrieve pool status",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         )
 
 
-# ============================================================================
-# Graceful shutdown
-# ============================================================================
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    logger.info("Shutting down — closing DB connections…")
-    close_db_connections()
-    logger.info("Shutdown complete.")

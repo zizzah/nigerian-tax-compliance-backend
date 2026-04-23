@@ -6,9 +6,7 @@ Enhanced with proper CORS configuration and security settings
 PRODUCTION OPTIMIZED: Added rate limiting, pagination, and Nigerian tax settings
 """
 from pydantic_settings import BaseSettings # type: ignore
-from pydantic import Field # type: ignore
 from typing import List, Optional
-import os
 
 
 class Settings(BaseSettings):
@@ -25,9 +23,9 @@ class Settings(BaseSettings):
     
     # Database Pool Settings (for enhanced database.py)
     DB_POOL_SIZE: int = 20  # pydantic reads DB_POOL_SIZE from env automatically
-    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "30"))
-    DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-    DB_POOL_RECYCLE: int = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+    DB_MAX_OVERFLOW: int = 30
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 3600
     
     # Security
     SECRET_KEY: str
@@ -159,7 +157,8 @@ class Settings(BaseSettings):
     # MONITORING (Optional)
     # ====================================================================
     SENTRY_DSN: Optional[str] = None
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_LEVEL: str = "INFO"
+
     
     class Config:
         env_file = ".env"

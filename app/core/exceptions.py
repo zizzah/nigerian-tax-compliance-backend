@@ -8,12 +8,13 @@ from fastapi import Request, status  # type: ignore
 from fastapi.responses import JSONResponse  # type: ignore
 from fastapi.exceptions import RequestValidationError  # type: ignore
 from starlette.exceptions import HTTPException as StarletteHTTPException  # type: ignore
-from pydantic import ValidationError  # type: ignore
 import logging
 import traceback
 import sys
 from datetime import datetime, timezone
 from typing import Any, Dict
+from sqlalchemy.exc import IntegrityError, OperationalError, DBAPIError  # type: ignore
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -246,29 +247,29 @@ async def custom_exception_handler(request: Request, exc: BaseAPIException):
         }
     )
 
-
 async def general_exception_handler(request: Request, exc: Exception):
     exc_type, exc_value, exc_traceback = sys.exc_info()
-    tb_str = ''.join(traceback.format_exception(...)) # type: ignore
+    tb_str = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
     
     logger.error(
-        f"Unhandled exception: {str(exc)}",
-        extra={"traceback": tb_str}  # ✅ logged server side
+        "Unhandled exception: %s",
+        str(exc),
+        extra={"traceback": tb_str}  # full crash details logged server-side
     )
     
     return JSONResponse(
         status_code=500,
         content={
             "error": {
-                "message": "An unexpected error occurred."  # ✅ sanitized for user
+                "message": "An unexpected error occurred."  # nothing leaked to client
             }
         }
     )
+
 # ============================================================================
 # DATABASE ERROR HANDLING
 # ============================================================================
 
-from sqlalchemy.exc import IntegrityError, OperationalError, DBAPIError  # type: ignore
 
 
 async def database_exception_handler(request: Request, exc: DBAPIError):
@@ -291,7 +292,7 @@ async def database_exception_handler(request: Request, exc: DBAPIError):
             
             # Try to extract field name
             if "key" in error_str:
-                import re
+                
                 match = re.search(r'Key \((.*?)\)', str(exc.orig))
                 if match:
                     details["field"] = match.group(1)
@@ -336,29 +337,3 @@ async def database_exception_handler(request: Request, exc: DBAPIError):
     )
 
 
-# ============================================================================
-# REGISTER EXCEPTION HANDLERS (Add to app/main.py)
-# ============================================================================
-
-"""
-Add to app/main.py:
-
-from app.core.exceptions import (
-    http_exception_handler,
-    validation_exception_handler,
-    custom_exception_handler,
-    general_exception_handler,
-    database_exception_handler,
-    BaseAPIException
-)
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import DBAPIError
-
-# Register exception handlers
-app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(BaseAPIException, custom_exception_handler)
-app.add_exception_handler(DBAPIError, database_exception_handler)
-app.add_exception_handler(Exception, general_exception_handler)
-"""
