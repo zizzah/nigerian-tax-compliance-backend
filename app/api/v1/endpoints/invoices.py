@@ -152,6 +152,12 @@ async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     return business
 
 
+async def maybe_get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business | None:
+    """Get user's business or None for onboarding-safe read endpoints."""
+    result = await db.execute(select(Business).where(Business.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
 async def verify_customer_belongs_to_business(db: AsyncSession, customer_id: uuid.UUID, business_id: uuid.UUID) -> Customer:
     """Verify customer belongs to business"""
     result = await db.execute(select(Customer).where(
@@ -558,7 +564,15 @@ async def list_invoices(
     db: AsyncSession = Depends(get_db)
 ):
     """Get paginated list of invoices"""
-    business = await get_user_business(db, current_user.id) # type: ignore
+    business = await maybe_get_user_business(db, current_user.id) # type: ignore
+    if not business:
+        return {
+            "invoices": [],
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+        }
 
     filters = [Invoice.business_id == business.id]
     if status:
@@ -778,7 +792,21 @@ async def get_invoice_statistics(
     db: AsyncSession = Depends(get_db)
 ):
     """Get invoice statistics"""
-    business = await get_user_business(db, current_user.id)  # type: ignore
+    business = await maybe_get_user_business(db, current_user.id)  # type: ignore
+    if not business:
+        return {
+            "total_invoices": 0,
+            "draft_invoices": 0,
+            "sent_invoices": 0,
+            "paid_invoices": 0,
+            "overdue_invoices": 0,
+            "cancelled_invoices": 0,
+            "total_invoiced": 0,
+            "total_paid": 0,
+            "total_outstanding": 0,
+            "average_invoice_value": 0,
+            "average_days_to_payment": None,
+        }
 
     stmt = select(
         func.count().label("total_invoices"),

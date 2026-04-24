@@ -53,6 +53,12 @@ async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     return business
 
 
+async def maybe_get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business | None:
+    """Get user's business or None for onboarding-safe read endpoints."""
+    result = await db.execute(select(Business).where(Business.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
 # ============================================================================
 # Customer CRUD Endpoints - PRODUCTION OPTIMIZED
 # ============================================================================
@@ -179,7 +185,17 @@ async def list_customers(
     - has_prev: Whether there are previous pages
     """
     try:
-        business = await get_user_business(db, current_user.id) # type: ignore
+        business = await maybe_get_user_business(db, current_user.id) # type: ignore
+        if not business:
+            return {
+                "customers": [],
+                "total": 0,
+                "page": 1,
+                "page_size": limit,
+                "total_pages": 0,
+                "has_next": False,
+                "has_prev": False,
+            }
         
         # Base query - optimized with proper filtering
         query =  select(Customer).where(Customer.business_id == business.id)
@@ -281,7 +297,9 @@ async def search_customers(
     **Returns:** Lightweight customer summaries with essential fields only
     """
     try:
-        business = await get_user_business(db, current_user.id) # type: ignore
+        business = await maybe_get_user_business(db, current_user.id) # type: ignore
+        if not business:
+            return []
         
         search_term = f"%{q}%"
         
@@ -473,7 +491,9 @@ async def list_customers_summary(
     
     **Performance:** Returns only essential fields for better performance
     """
-    business = await  get_user_business(db, current_user.id) # type: ignore
+    business = await maybe_get_user_business(db, current_user.id) # type: ignore
+    if not business:
+        return []
     
     customers = await db.execute(
         select(Customer).where(
@@ -763,7 +783,15 @@ async def get_customer_statistics(
     AFTER: Uses database aggregation only → <100ms
     """
     try:
-        business = await get_user_business(db, current_user.id)   # type: ignore
+        business = await maybe_get_user_business(db, current_user.id)   # type: ignore
+        if not business:
+            return {
+                "total_customers": 0,
+                "active_customers": 0,
+                "inactive_customers": 0,
+                "average_payment_days": None,
+                "top_customers": [],
+            }
         
         # ==================================================================
         # OPTIMIZATION: Use database aggregation (not Python)

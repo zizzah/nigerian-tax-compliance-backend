@@ -49,6 +49,11 @@ async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     return business
 
 
+async def maybe_get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business | None:
+    result = await db.execute(select(Business).where(Business.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
 async def get_product_by_id(
     db: AsyncSession,
     product_id: uuid.UUID,
@@ -161,7 +166,9 @@ async def list_products_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await get_user_business(db, current_user.id)  # type: ignore
+    business = await maybe_get_user_business(db, current_user.id)  # type: ignore
+    if not business:
+        return []
     result = await db.execute(
         select(Product)
         .where(Product.business_id == business.id, Product.is_active == True)
@@ -193,7 +200,9 @@ async def list_product_categories(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await get_user_business(db, current_user.id)  # type: ignore
+    business = await maybe_get_user_business(db, current_user.id)  # type: ignore
+    if not business:
+        return {"categories": []}
     result = await db.execute(
         select(Product.category)
         .where(Product.business_id == business.id, Product.category.isnot(None))
@@ -213,7 +222,15 @@ async def list_products(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await get_user_business(db, current_user.id)  # type: ignore
+    business = await maybe_get_user_business(db, current_user.id)  # type: ignore
+    if not business:
+        return {
+            "products": [],
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+        }
 
     query = select(Product).where(Product.business_id == business.id)
 

@@ -35,6 +35,13 @@ async def _get_business(db: AsyncSession, user: User) -> Business:
     return biz
 
 
+async def _maybe_get_business(db: AsyncSession, user: User) -> Business | None:
+    result = await db.execute(
+        select(Business).where(Business.user_id == user.id)
+    )
+    return result.scalar_one_or_none()
+
+
 def _serialize_insight(insight: AIInsight) -> dict:
     return {
         "id": str(insight.id),
@@ -57,7 +64,9 @@ async def get_insights(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    biz = await _get_business(db, current_user)
+    biz = await _maybe_get_business(db, current_user)
+    if not biz:
+        return {"insights": [], "cached": True}
 
     today_start = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0

@@ -34,6 +34,13 @@ async def _get_business(db: AsyncSession, user: User) -> Business:
     return biz
 
 
+async def _maybe_get_business(db: AsyncSession, user: User) -> Business | None:
+    result = await db.execute(
+        select(Business).where(Business.user_id == user.id)
+    )
+    return result.scalars().first()
+
+
 def _get_next_filing_date(obligation_type: str, today: date) -> date:
     year, month = today.year, today.month
 
@@ -74,9 +81,17 @@ async def get_tax_obligations(
     Async tax obligation estimator based on real financial data.
     """
 
-    biz = await _get_business(db, current_user)
-
     today = date.today()
+    biz = await _maybe_get_business(db, current_user)
+    if not biz:
+        return {
+            "obligations": [],
+            "total_estimated_liability": 0,
+            "next_due": None,
+            "as_of": today.isoformat(),
+            "disclaimer": "Create a business profile to start tracking tax obligations.",
+        }
+
     current_month_start = today.replace(day=1)
     prev_month_start = (current_month_start - timedelta(days=1)).replace(day=1)
     prev_month_end = current_month_start - timedelta(days=1)
