@@ -5,6 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
+    fonts-dejavu-core \
     libpq-dev \
     poppler-utils \
     tesseract-ocr \
