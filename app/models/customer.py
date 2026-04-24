@@ -74,33 +74,33 @@ class Customer(Base):
         """Calculate outstanding amount (invoiced - paid)"""
         return float(self.total_invoiced_amount - self.total_paid_amount) # type: ignore
     
-async def update_analytics(self, db_session):
-    """Update customer analytics from invoices"""
-    from app.models.invoice import Invoice, InvoiceStatus
-    from sqlalchemy import select
+    async def update_analytics(self, db_session):
+        """Update customer analytics from invoices"""
+        from app.models.invoice import Invoice, InvoiceStatus
+        from sqlalchemy import select
 
-    result = await db_session.execute(
-        select(Invoice).where(
-            Invoice.customer_id == self.id,
-            Invoice.status != InvoiceStatus.CANCELLED
+        result = await db_session.execute(
+            select(Invoice).where(
+                Invoice.customer_id == self.id,
+                Invoice.status != InvoiceStatus.CANCELLED
+            )
         )
-    )
-    invoices = result.scalars().all()
+        invoices = result.scalars().all()
 
-    if not invoices:
-        return
+        if not invoices:
+            return
 
-    self.total_invoices_count = len(invoices)
-    self.total_invoiced_amount = sum(inv.total_amount for inv in invoices)
-    self.total_paid_amount = sum(inv.paid_amount for inv in invoices)
+        self.total_invoices_count = len(invoices)
+        self.total_invoiced_amount = sum(inv.total_amount for inv in invoices)
+        self.total_paid_amount = sum(inv.paid_amount for inv in invoices)
 
-    paid_invoices = [inv for inv in invoices if inv.paid_at and inv.status == InvoiceStatus.PAID]
-    if paid_invoices:
-        payment_days = [
-            (inv.paid_at.date() - inv.issue_date).days
-            for inv in paid_invoices
-        ]
-        self.average_payment_days = int(sum(payment_days) / len(payment_days))
+        paid_invoices = [inv for inv in invoices if inv.paid_at and inv.status == InvoiceStatus.PAID]
+        if paid_invoices:
+            payment_days = [
+                (inv.paid_at.date() - inv.issue_date).days
+                for inv in paid_invoices
+            ]
+            self.average_payment_days = int(sum(payment_days) / len(payment_days))
 
-    latest_invoice = max(invoices, key=lambda inv: inv.issue_date)
-    self.last_invoice_date = latest_invoice.issue_date
+        latest_invoice = max(invoices, key=lambda inv: inv.issue_date)
+        self.last_invoice_date = latest_invoice.issue_date
