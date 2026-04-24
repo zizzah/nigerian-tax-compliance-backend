@@ -2,7 +2,7 @@
 Business Pydantic Schemas
 Location: app/schemas/business.py
 """
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Optional
 import uuid
 from datetime import datetime
@@ -14,6 +14,8 @@ from datetime import datetime
 
 class BusinessCreate(BaseModel):
     """Schema for creating a business profile"""
+    model_config = ConfigDict(extra="ignore")
+
     business_name: str = Field(..., min_length=2, max_length=255, description="Business name")
     business_type: Optional[str] = Field(None, max_length=100, description="e.g., Limited Liability Company")
     industry: Optional[str] = Field(None, max_length=100, description="e.g., Technology, Retail")
@@ -26,7 +28,7 @@ class BusinessCreate(BaseModel):
     
     # Contact
     phone: Optional[str] = Field(None, max_length=20)
-    email: Optional[EmailStr] = None
+    email: Optional[str] = Field(None, max_length=255)
     address: Optional[str] = None
     city: Optional[str] = Field(None, max_length=100)
     state: Optional[str] = Field(None, max_length=50)
@@ -68,17 +70,11 @@ class BusinessCreate(BaseModel):
             return value or None
         return v
     
-    @field_validator('tin')
-    @classmethod
-    def validate_tin(cls, v):
-        """Validate TIN format (basic check)"""
-        if v and len(v) < 8:
-            raise ValueError('TIN must be at least 8 characters')
-        return v
-
 
 class BusinessUpdate(BaseModel):
     """Schema for updating business profile"""
+    model_config = ConfigDict(extra="ignore")
+
     business_name: Optional[str] = Field(None, min_length=2, max_length=255)
     business_type: Optional[str] = Field(None, max_length=100)
     industry: Optional[str] = Field(None, max_length=100)
@@ -91,7 +87,7 @@ class BusinessUpdate(BaseModel):
     
     # Contact
     phone: Optional[str] = Field(None, max_length=20)
-    email: Optional[EmailStr] = None
+    email: Optional[str] = Field(None, max_length=255)
     website: Optional[str] = Field(None, max_length=255)
     address: Optional[str] = None
     city: Optional[str] = Field(None, max_length=100)

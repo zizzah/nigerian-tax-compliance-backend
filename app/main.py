@@ -357,10 +357,22 @@ def root():
     }
 
 
+@app.head("/", tags=["System"], include_in_schema=False)
+def root_head():
+    """Allow platform health checks that use HEAD on the root path."""
+    return JSONResponse(status_code=200, content={})
+
+
 @app.get("/alive", tags=["System"])
 def alive():
     """Kubernetes liveness probe — confirms the process is running."""
     return {"alive": True, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.head("/alive", tags=["System"], include_in_schema=False)
+def alive_head():
+    """Allow liveness probes that use HEAD requests."""
+    return JSONResponse(status_code=200, content={})
 
 
 @app.get("/health", tags=["System"])
