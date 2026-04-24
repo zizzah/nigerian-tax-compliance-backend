@@ -73,7 +73,7 @@ class BusinessCreate(BaseModel):
 
 class BusinessUpdate(BaseModel):
     """Schema for updating business profile"""
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
 
     business_name: Optional[str] = Field(None, min_length=2, max_length=255)
     business_type: Optional[str] = Field(None, max_length=100)
@@ -138,9 +138,6 @@ class BusinessUpdate(BaseModel):
             return value or None
         return v
     
-    class Config:
-        from_attributes = True
-
 
 # ============================================================================
 # Response Schemas (Output)
@@ -148,6 +145,8 @@ class BusinessUpdate(BaseModel):
 
 class BusinessResponse(BaseModel):
     """Schema for business response"""
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     user_id: uuid.UUID
     
@@ -189,16 +188,12 @@ class BusinessResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     
-    class Config:
-        from_attributes = True
-
 
 class BusinessSummary(BaseModel):
     """Lightweight business summary"""
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     business_name: str
     industry: Optional[str]
     subscription_tier: str
-    
-    class Config:
-        from_attributes = True
