@@ -102,6 +102,14 @@ def _register_unicode_fonts() -> tuple[str, str]:
 FONT_NORMAL, FONT_BOLD = _register_unicode_fonts()
 PDF_CURRENCY_SYMBOL = "₦" if FONT_NORMAL != "Helvetica" else "NGN "
 
+# Default PDF palette aligned with the frontend's TaxFlow NG theme.
+DEFAULT_BRAND_GREEN = "#1a6b4a"
+DEFAULT_BRAND_GOLD = "#c8952a"
+DEFAULT_BRAND_PAPER = "#faf9f6"
+DEFAULT_BRAND_WARM = "#ede9de"
+DEFAULT_BRAND_TEXT = "#2c2a24"
+DEFAULT_BRAND_TEXT_MID = "#6b6560"
+
 
 def _is_valid_hex(h: str) -> bool:
     return h.startswith('#') and len(h) == 7 and all(c in '0123456789abcdefABCDEF' for c in h[1:])
@@ -294,18 +302,19 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     # Brand colours
     primary_hex = _sanitise_brand_color(
         getattr(business, 'primary_color', None) or '',
-        '#1a6b4a',
+        DEFAULT_BRAND_GREEN,
     )
     secondary_hex = _sanitise_brand_color(
         getattr(business, 'secondary_color', None) or '',
-        '#c8952a',
+        DEFAULT_BRAND_GOLD,
     )
 
     col_primary   = colors.HexColor(primary_hex)
     col_secondary = colors.HexColor(secondary_hex)
-    col_ink       = colors.HexColor('#0f0e0b')
-    col_dim       = colors.HexColor('#6b6560')
-    col_border    = colors.HexColor('#ddd9cf')
+    col_ink       = colors.HexColor(DEFAULT_BRAND_TEXT)
+    col_dim       = colors.HexColor(DEFAULT_BRAND_TEXT_MID)
+    col_border    = colors.HexColor(DEFAULT_BRAND_WARM)
+    col_paper     = colors.HexColor(DEFAULT_BRAND_PAPER)
 
     def _tint(hex_color: str, factor: float = 0.10) -> colors.Color:
         r = int(hex_color[1:3], 16); g = int(hex_color[3:5], 16); b = int(hex_color[5:7], 16)
@@ -468,7 +477,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
         ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ('LEFTPADDING',   (0, 0), (-1, -1), 6),
         ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
-        ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, col_row_alt]),
+        ('ROWBACKGROUNDS',(0, 1), (-1, -1), [col_paper, col_row_alt]),
         ('LINEBELOW',     (0, 1), (-1, -2), 0.3, col_border),
         ('FONTSIZE',      (0, 1), (-1, -1), 9),
     ]))
