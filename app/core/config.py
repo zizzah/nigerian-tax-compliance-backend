@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
     TEST_DATABASE_URL: Optional[str] = None
+    ENCRYPTION_KEY: Optional[str] = None
+
     
     # Database Pool Settings (for enhanced database.py)
     DB_POOL_SIZE: int = 20  # pydantic reads DB_POOL_SIZE from env automatically
