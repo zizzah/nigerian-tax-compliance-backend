@@ -14,7 +14,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     op.execute("""
-        DO `push
+        DO $$
         BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
@@ -25,7 +25,7 @@ def upgrade() -> None:
                 CHECK (quantity_in_stock >= 0);
             END IF;
         END
-        `push;
+        $$;
     """)
 
 def downgrade() -> None:
