@@ -7,15 +7,18 @@ CHANGES FROM PREVIOUS VERSION:
   - connect_args: sslmode=require (Neon mandates SSL)
   - pool_size / max_overflow kept conservative so we stay inside Neon free tier
   - All other monitoring helpers retained unchanged
+  - Strip ?sslmode= / &sslmode= from DATABASE_URL — asyncpg rejects that param;
+    ssl= in connect_args handles it instead
 """
-from sqlalchemy import  event,text  # type: ignore
+import re
+
+from sqlalchemy import event, text  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker  # type: ignore
 
 from app.core.config import settings
 from typing import AsyncGenerator
 import logging
 from app.core.base import Base
-
 
 
 logger = logging.getLogger(__name__)
@@ -56,14 +59,23 @@ else:  # development / test
 
 # ── Engine ───────────────────────────────────────────────────────────────────
 #
-# CHANGE 4: Neon requires SSL and benefits from a short pool_recycle.
-# sslmode=require is safe for all environments when DATABASE_URL points to
-# Neon; for local Postgres without SSL just set ENVIRONMENT=development and
-# the same settings still work (SSL is negotiated automatically if available).
+# asyncpg does not accept `sslmode` as a connect argument — it uses ssl=
+# in connect_args instead.  Render (and many other hosts) append
+# ?sslmode=require to DATABASE_URL, so we strip it here before handing
+# the URL to SQLAlchemy.
 #
 
-async_engine   = create_async_engine(
-    settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1).replace("postgres://", "postgresql+asyncpg://", 1),
+_db_url = settings.DATABASE_URL
+_db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+_db_url = _db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+# Strip sslmode — asyncpg rejects it; ssl= in connect_args handles SSL instead
+if "?sslmode=" in _db_url:
+    _db_url = _db_url.split("?sslmode=")[0]
+elif "&sslmode=" in _db_url:
+    _db_url = re.sub(r"&sslmode=[^&]+", "", _db_url)
+
+async_engine = create_async_engine(
+    _db_url,
     pool_size=POOL_SIZE,
     max_overflow=MAX_OVERFLOW,
     pool_timeout=POOL_TIMEOUT,
@@ -76,10 +88,8 @@ async_engine   = create_async_engine(
         "timeout": 10,
         "server_settings": {"timezone": "UTC"},
         "statement_cache_size": 0,
-        
     },
 )
-
 
 
 logger.info(
@@ -112,16 +122,11 @@ def receive_checkin(dbapi_conn, connection_record):
 
 # ── Session factory ──────────────────────────────────────────────────────────
 
-
-
 async_session_factory = async_sessionmaker(
-    async_engine  ,
+    async_engine,
     class_=AsyncSession,
     expire_on_commit=False,
 )
-
-
-
 
 
 # ── FastAPI dependency ───────────────────────────────────────────────────────
@@ -135,17 +140,15 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         @router.get("/items")
         async def get_items(db: AsyncSession = Depends(get_db)):
             result = await db.execute(select(Item))
-            return result.scalars().all()   
+            return result.scalars().all()
     """
     async with async_session_factory() as session:
         try:
             yield session
-            
         except Exception as exc:
             await session.rollback()
             logger.error("DB session error: %s", exc)
             raise
-        
 
 
 # ── Utility helpers ──────────────────────────────────────────────────────────
@@ -153,9 +156,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def check_database_connection() -> bool:
     """Return True if the database is reachable, False otherwise."""
     try:
-    
         async with async_engine.connect() as session:
-            
             await session.execute(text("SELECT 1"))
         logger.info("Database connection check: OK")
         return True
@@ -167,17 +168,17 @@ async def check_database_connection() -> bool:
 async def get_pool_status() -> dict:
     """Return current connection-pool statistics."""
     stats = {
-        "size":         async_engine  .pool.size(), # type: ignore
-        "checked_in":   async_engine.pool.checkedin(), # type: ignore
-        "checked_out":  async_engine.pool.checkedout(), # type: ignore
-        "overflow":     async_engine.pool.overflow(), # type: ignore
+        "size":         async_engine.pool.size(),  # type: ignore
+        "checked_in":   async_engine.pool.checkedin(),  # type: ignore
+        "checked_out":  async_engine.pool.checkedout(),  # type: ignore
+        "overflow":     async_engine.pool.overflow(),  # type: ignore
         "max_overflow": MAX_OVERFLOW,
         "pool_size":    POOL_SIZE,
         "pool_recycle": POOL_RECYCLE,
         "environment":  ENVIRONMENT,
     }
     logger.debug("Pool status: %s", stats)
-    return   stats
+    return stats
 
 
 # Backwards-compat alias
