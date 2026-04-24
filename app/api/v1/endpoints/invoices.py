@@ -56,6 +56,8 @@ try:
     from reportlab.lib.units import inch, mm
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -66,6 +68,69 @@ router = APIRouter(prefix="/invoices", tags=["Invoices"])
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+
+def _register_unicode_fonts() -> tuple[str, str]:
+    """Register a Unicode-capable font for PDF currency rendering."""
+    if not PDF_AVAILABLE:
+        return "Helvetica", "Helvetica-Bold"
+
+    candidates = [
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        ),
+        (
+            os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf"),
+            os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf"),
+        ),
+    ]
+
+    for regular_path, bold_path in candidates:
+        if os.path.exists(regular_path) and os.path.exists(bold_path):
+            pdfmetrics.registerFont(TTFont("DejaVuSans", regular_path))
+            pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
+            return "DejaVuSans", "DejaVuSans-Bold"
+
+    return "Helvetica", "Helvetica-Bold"
+
+
+FONT_NORMAL, FONT_BOLD = _register_unicode_fonts()
+PDF_CURRENCY_SYMBOL = "₦" if FONT_NORMAL != "Helvetica" else "NGN "
+
+
+def _is_valid_hex(h: str) -> bool:
+    return h.startswith('#') and len(h) == 7 and all(c in '0123456789abcdefABCDEF' for c in h[1:])
+
+
+def _relative_luminance(hex_color: str) -> float:
+    """Return relative luminance from 0 (black) to 1 (white)."""
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+    def _lin(c: float) -> float:
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
+
+
+def _sanitise_brand_color(hex_input: str, fallback: str) -> str:
+    h = (hex_input or "").strip().lower()
+    if not _is_valid_hex(h):
+        return fallback
+
+    lum = _relative_luminance(h)
+    if lum < 0.05 or lum > 0.90:
+        return fallback
+
+    return h
+
+
+def _pdf_money(amount: float) -> str:
+    return f"{PDF_CURRENCY_SYMBOL}{float(amount):,.2f}"
 
 async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     """Get user's business or raise 404"""
@@ -227,12 +292,14 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
         )
 
     # Brand colours
-    primary_hex   = (getattr(business, 'primary_color',   None) or '#c8952a').strip()
-    secondary_hex = (getattr(business, 'secondary_color', None) or '#1a6b4a').strip()
-    if not primary_hex.startswith('#') or len(primary_hex) != 7:
-        primary_hex = '#c8952a'
-    if not secondary_hex.startswith('#') or len(secondary_hex) != 7:
-        secondary_hex = "#ffffff"
+    primary_hex = _sanitise_brand_color(
+        getattr(business, 'primary_color', None) or '',
+        '#1a6b4a',
+    )
+    secondary_hex = _sanitise_brand_color(
+        getattr(business, 'secondary_color', None) or '',
+        '#c8952a',
+    )
 
     col_primary   = colors.HexColor(primary_hex)
     col_secondary = colors.HexColor(secondary_hex)
@@ -253,10 +320,37 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     elements = []
     styles   = getSampleStyleSheet()
 
-    normal_style  = ParagraphStyle('N', parent=styles['Normal'], fontSize=9, textColor=col_ink, leading=13)
-    dim_style     = ParagraphStyle('D', parent=styles['Normal'], fontSize=8, textColor=col_dim, leading=11)
-    heading_style = ParagraphStyle('H', parent=styles['Normal'], fontSize=10, textColor=col_ink, fontName='Helvetica-Bold')
-    label_style   = ParagraphStyle('L', parent=styles['Normal'], fontSize=7.5, textColor=col_dim, fontName='Helvetica', leading=10)
+    normal_style = ParagraphStyle(
+        'N',
+        parent=styles['Normal'],
+        fontSize=9,
+        textColor=col_ink,
+        leading=13,
+        fontName=FONT_NORMAL,
+    )
+    dim_style = ParagraphStyle(
+        'D',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=col_dim,
+        leading=11,
+        fontName=FONT_NORMAL,
+    )
+    heading_style = ParagraphStyle(
+        'H',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=col_ink,
+        fontName=FONT_BOLD,
+    )
+    label_style = ParagraphStyle(
+        'L',
+        parent=styles['Normal'],
+        fontSize=7.5,
+        textColor=col_dim,
+        fontName=FONT_NORMAL,
+        leading=10,
+    )
 
     # Logo
     logo_img = None
@@ -277,12 +371,12 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     # Header: logo/name left | INVOICE right
     brand_para = Paragraph(
         f"<b>{business.business_name or 'Business'}</b>",  # type: ignore
-        ParagraphStyle('Brand', parent=styles['Normal'], fontSize=15, textColor=col_ink, fontName='Helvetica-Bold')
+        ParagraphStyle('Brand', parent=styles['Normal'], fontSize=15, textColor=col_ink, fontName=FONT_BOLD)
     )
     invoice_label = Paragraph(
         f"<font color='{primary_hex}' size='26'><b>INVOICE</b></font>"
         f"<br/><font size='9' color='#6b6560'>{invoice.invoice_number}</font>",
-        ParagraphStyle('InvLabel', parent=styles['Normal'], fontSize=26, alignment=TA_RIGHT)
+        ParagraphStyle('InvLabel', parent=styles['Normal'], fontSize=26, alignment=TA_RIGHT, fontName=FONT_BOLD)
     )
     left_cell = [logo_img, Spacer(1, 4), brand_para] if logo_img else [brand_para]
     header_table = Table([[left_cell, invoice_label]], colWidths=[3.5*inch, 3.5*inch])
@@ -353,7 +447,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     elements.append(Spacer(1, 16))
 
     # Line items
-    hdr_style = ParagraphStyle('TH', parent=styles['Normal'], fontSize=7.5, textColor=colors.white, fontName='Helvetica-Bold')
+    hdr_style = ParagraphStyle('TH', parent=styles['Normal'], fontSize=7.5, textColor=colors.white, fontName=FONT_BOLD)
     def _p(text, st=normal_style): return Paragraph(str(text), st)
 
     items_data = [[_p('DESCRIPTION', hdr_style), _p('QTY', hdr_style), _p('UNIT PRICE', hdr_style), _p('TAX', hdr_style), _p('AMOUNT', hdr_style)]]
@@ -361,11 +455,11 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
         items_data.append([
             _p(item.description or 'Item'),
             _p(str(item.quantity)),
-            _p(f'\u20a6{float(item.unit_price):,.2f}'),
+            _p(_pdf_money(float(item.unit_price))),
             _p(f'{item.tax_rate or 0}%'),
-            _p(f'\u20a6{float(item.line_total):,.2f}'),
+            _p(_pdf_money(float(item.line_total))),
         ])
-    items_table = Table(items_data, colWidths=[3.1*inch, 0.55*inch, 1.05*inch, 0.6*inch, 0.9*inch], repeatRows=1)
+    items_table = Table(items_data, colWidths=[2.6*inch, 0.5*inch, 1.3*inch, 0.6*inch, 1.2*inch], repeatRows=1)
     items_table.setStyle(TableStyle([
         ('BACKGROUND',    (0, 0), (-1, 0),  col_primary),
         ('ALIGN',         (1, 0), (-1, -1), 'RIGHT'),
@@ -384,24 +478,24 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
     # Totals
     def _total_row(label, amount, bold=False, highlight=False):
         ls = ParagraphStyle('tl', parent=styles['Normal'], fontSize=9,
-                            fontName='Helvetica-Bold' if bold else 'Helvetica',
+                            fontName=FONT_BOLD if bold else FONT_NORMAL,
                             textColor=col_primary if highlight else col_ink, alignment=TA_RIGHT)
         vs = ParagraphStyle('tv', parent=styles['Normal'], fontSize=9,
-                            fontName='Helvetica-Bold' if bold else 'Helvetica',
+                            fontName=FONT_BOLD if bold else FONT_NORMAL,
                             textColor=col_primary if highlight else col_ink, alignment=TA_RIGHT)
         return ['', '', '', Paragraph(label, ls), Paragraph(amount, vs)]
 
-    totals_data = [_total_row('Subtotal', f'\u20a6{float(invoice.subtotal):,.2f}')]  # type: ignore
+    totals_data = [_total_row('Subtotal', _pdf_money(float(invoice.subtotal)))]  # type: ignore
     if float(invoice.discount_amount or 0) > 0:  # type: ignore
-        totals_data.append(_total_row('Discount', f'-\u20a6{float(invoice.discount_amount):,.2f}'))  # type: ignore
-    totals_data.append(_total_row('VAT', f'\u20a6{float(invoice.tax_amount):,.2f}'))  # type: ignore
-    totals_data.append(_total_row('TOTAL DUE', f'\u20a6{float(invoice.total_amount):,.2f}', bold=True, highlight=True))  # type: ignore
+        totals_data.append(_total_row('Discount', f'-{_pdf_money(float(invoice.discount_amount))}'))  # type: ignore
+    totals_data.append(_total_row('VAT', _pdf_money(float(invoice.tax_amount))))  # type: ignore
+    totals_data.append(_total_row('TOTAL DUE', _pdf_money(float(invoice.total_amount)), bold=True, highlight=True))  # type: ignore
     if float(invoice.paid_amount or 0) > 0:  # type: ignore
-        totals_data.append(_total_row('Paid', f'\u20a6{float(invoice.paid_amount):,.2f}'))  # type: ignore
-        totals_data.append(_total_row('Balance Due', f'\u20a6{float(invoice.outstanding_amount):,.2f}', bold=True, highlight=True))  # type: ignore
+        totals_data.append(_total_row('Paid', _pdf_money(float(invoice.paid_amount))))  # type: ignore
+        totals_data.append(_total_row('Balance Due', _pdf_money(float(invoice.outstanding_amount)), bold=True, highlight=True))  # type: ignore
 
     total_row_idx = next(i for i, r in enumerate(totals_data) if 'TOTAL DUE' in r[3].text)
-    totals_table = Table(totals_data, colWidths=[2*inch, 1*inch, 1*inch, 1.4*inch, 0.8*inch])
+    totals_table = Table(totals_data, colWidths=[2.5*inch, 0.8*inch, 0.8*inch, 1.8*inch, 1.1*inch])
     totals_table.setStyle(TableStyle([
         ('ALIGN',        (3, 0), (-1, -1), 'RIGHT'),
         ('TOPPADDING',   (0, 0), (-1, -1), 3),
@@ -422,7 +516,7 @@ def generate_invoice_pdf(invoice: Invoice, business: Business, customer: Custome
         f'<font color="{primary_hex}">\u2014 </font>'
         f'Thank you for your business! '
         f'Questions? Contact {business.email or business.phone or "us"}',  # type: ignore
-        ParagraphStyle('Foot', parent=styles['Normal'], fontSize=8, textColor=col_dim, alignment=TA_CENTER)
+        ParagraphStyle('Foot', parent=styles['Normal'], fontSize=8, textColor=col_dim, alignment=TA_CENTER, fontName=FONT_NORMAL)
     ))
 
     doc.build(elements)
