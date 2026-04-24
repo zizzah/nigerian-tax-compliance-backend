@@ -11,7 +11,7 @@ from sqlalchemy import Column, Boolean, String, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 class PaymentLink(Base):

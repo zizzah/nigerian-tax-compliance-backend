@@ -12,7 +12,7 @@ from sqlalchemy import Column, Integer, Numeric, DateTime, ForeignKey, UniqueCon
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 # ---------------------------------------------------------------------------

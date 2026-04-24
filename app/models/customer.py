@@ -8,7 +8,7 @@ from sqlalchemy.orm import relationship, column_property # type: ignore
 from sqlalchemy import select, func # type: ignore
 import uuid
 from datetime import datetime, timezone
-from app.core.database import Base
+from app.core.base import Base
 
 
 class Customer(Base):

@@ -8,7 +8,7 @@ from sqlalchemy.orm import relationship # type: ignore
 import uuid
 from datetime import datetime, timezone
 import enum
-from app.core.database import Base
+from app.core.base import Base
 
 
 class SubscriptionTier(str, enum.Enum):

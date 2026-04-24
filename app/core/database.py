@@ -10,11 +10,13 @@ CHANGES FROM PREVIOUS VERSION:
 """
 from sqlalchemy import  event,text  # type: ignore
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker  # type: ignore
-from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 from typing import AsyncGenerator
 import logging
+from app.core.base import Base
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +120,8 @@ async_session_factory = async_sessionmaker(
     expire_on_commit=False,
 )
 
-# ── Declarative base ─────────────────────────────────────────────────────────
 
 
-class Base(DeclarativeBase):
-    pass
 
 
 # ── FastAPI dependency ───────────────────────────────────────────────────────

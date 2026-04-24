@@ -10,7 +10,7 @@ from decimal import Decimal
 import uuid
 import enum
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 class PaymentMethod(enum.Enum):

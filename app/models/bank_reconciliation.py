@@ -15,7 +15,7 @@ from sqlalchemy import Column, String, Integer, Numeric, Date, DateTime, Foreign
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 class BankReconciliation(Base):

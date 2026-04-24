@@ -4,7 +4,7 @@ Location: app/models/__init__.py
 
 Import ALL models here so Alembic can detect them and relationships resolve.
 """
-from app.core.database import Base
+from app.core.base import Base
 
 # Core auth & business
 from app.models.user import User

@@ -8,7 +8,7 @@ from sqlalchemy import Column, String, Enum, DateTime, Numeric, Text, Boolean, D
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 import uuid
 from datetime import datetime
-from app.core.database import Base
+from app.core.base import Base
 import enum
 
 

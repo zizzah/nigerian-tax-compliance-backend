@@ -18,7 +18,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Enum as SQLEnum
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 # ── Enums (must match PostgreSQL enum type names exactly) ─────────────────────

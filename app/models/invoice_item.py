@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import uuid
 
-from app.core.database import Base
+from app.core.base import Base
 
 
 class InvoiceItem(Base):

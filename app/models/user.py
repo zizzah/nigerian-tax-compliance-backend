@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
 from datetime import datetime, timezone
-from app.core.database import Base
+from app.core.base import Base
 
 
 class User(Base):
