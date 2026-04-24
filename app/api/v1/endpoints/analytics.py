@@ -28,6 +28,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
 
+def _empty_dashboard_payload() -> dict:
+    """Return a safe empty dashboard for newly registered users without a business profile."""
+    return {
+        "total_invoices": 0,
+        "draft_count": 0,
+        "sent_count": 0,
+        "paid_count": 0,
+        "overdue_count": 0,
+        "cancelled_count": 0,
+        "partially_paid_count": 0,
+        "total_invoiced": 0.0,
+        "total_collected": 0.0,
+        "total_outstanding": 0.0,
+        "overdue_amount": 0.0,
+        "total_expenses": 0.0,
+        "cogs": 0.0,
+        "net_profit": 0.0,
+        "profit_margin": 0.0,
+        "health": "no_data",
+        "active_customers": 0,
+        "revenue_by_month": [],
+        "recent_invoices": [],
+        "recent_payments": [],
+    }
+
+
 async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     result  = await db.execute(select(Business).where(Business.user_id == user_id))
     business = result.scalars().first()
@@ -46,7 +72,10 @@ async def get_dashboard_stats(
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
+        result = await db.execute(select(Business).where(Business.user_id == current_user.id))
+        business = result.scalars().first()
+        if not business:
+            return _empty_dashboard_payload()
         bid = business.id
 
         # ------------------------------------------------------------------ #

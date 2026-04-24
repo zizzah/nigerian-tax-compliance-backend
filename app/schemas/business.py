@@ -30,6 +30,43 @@ class BusinessCreate(BaseModel):
     address: Optional[str] = None
     city: Optional[str] = Field(None, max_length=100)
     state: Optional[str] = Field(None, max_length=50)
+    country: Optional[str] = Field("Nigeria", max_length=50)
+    website: Optional[str] = Field(None, max_length=255)
+
+    @field_validator(
+        'business_name',
+        'business_type',
+        'industry',
+        'tin',
+        'vat_number',
+        'rc_number',
+        'phone',
+        'address',
+        'city',
+        'state',
+        'country',
+        'website',
+        mode='before',
+    )
+    @classmethod
+    def normalize_strings(cls, v):
+        """Trim strings and convert blank optional values to None."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip()
+            return value or None
+        return v
+
+    @field_validator('email', mode='before')
+    @classmethod
+    def normalize_email(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip().lower()
+            return value or None
+        return v
     
     @field_validator('tin')
     @classmethod
@@ -67,6 +104,43 @@ class BusinessUpdate(BaseModel):
     
     # Invoice Settings
     invoice_prefix: Optional[str] = Field(None, min_length=1, max_length=10)
+
+    @field_validator(
+        'business_name',
+        'business_type',
+        'industry',
+        'tin',
+        'vat_number',
+        'rc_number',
+        'phone',
+        'website',
+        'address',
+        'city',
+        'state',
+        'logo_url',
+        'primary_color',
+        'secondary_color',
+        'invoice_prefix',
+        mode='before',
+    )
+    @classmethod
+    def normalize_optional_strings(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip()
+            return value or None
+        return v
+
+    @field_validator('email', mode='before')
+    @classmethod
+    def normalize_update_email(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            value = v.strip().lower()
+            return value or None
+        return v
     
     class Config:
         from_attributes = True

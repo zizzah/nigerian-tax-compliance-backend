@@ -300,7 +300,15 @@ async def get_paystack_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Check whether this business has Paystack keys configured."""
-    business = await get_business_or_404(db, current_user.id)
+    result = await db.execute(select(Business).where(Business.user_id == current_user.id))
+    business = result.scalar_one_or_none()
+
+    if not business:
+        return {
+            "has_public_key": False,
+            "has_secret_key": False,
+            "configured": False,
+        }
 
     
     return {
