@@ -91,7 +91,7 @@ async def get_insights(
 
     # ⚠️ KEEP SYNC (do NOT change unless engine is async)
     engine = InsightsEngine()
-    new_insights = engine.generate_insights(db, biz) # type: ignore
+    new_insights = await  engine.generate_insights(db, biz) # type: ignore
 
     return {
         "insights": [_serialize_insight(i) for i in new_insights], # type: ignore
