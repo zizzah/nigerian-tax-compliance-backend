@@ -232,11 +232,29 @@ class InsightsEngine:
 
     def _build_prompt(self, metrics: dict) -> str:
         return f"""You are a financial intelligence system for Nigerian SMEs.
+Analyze this business's financial metrics and generate 3-6 specific, actionable insights.
 
 METRICS:
 {json.dumps(metrics, indent=2)}
 
-Return JSON array only (3-6 insights)."""
+Generate insights as a JSON array. Each insight must have:
+{{
+  "insight_type": "cash_flow" | "overdue_risk" | "customer_behavior" | "revenue_trend" | "anomaly" | "positive",
+  "severity": "info" | "warning" | "critical" | "positive",
+  "title": "Short punchy title (max 60 chars)",
+  "body": "2-3 sentences with specific numbers from the data. Be direct and actionable.",
+  "action_label": "Button text (max 30 chars, or null)",
+  "action_url": "/dashboard/path or null"
+}}
+
+Rules:
+- Use actual numbers from the metrics (₦ amounts, percentages, days)
+- critical = requires immediate action (e.g. >30 days overdue debt)
+- warning = needs attention soon
+- positive = celebrate good news
+- info = useful context
+- ONLY return the JSON array, nothing else
+"""
 
     # -------------------------
     # SAVE (TRANSACTION SAFE)
