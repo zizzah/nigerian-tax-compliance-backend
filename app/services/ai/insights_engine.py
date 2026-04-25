@@ -253,7 +253,7 @@ Return JSON array only (3-6 insights)."""
             hour=0, minute=0, second=0, microsecond=0
         )
 
-        async with db.begin():
+        async with db.begin_nested():
 
             await db.execute(
                 delete(AIInsight).where(
