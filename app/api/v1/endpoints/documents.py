@@ -85,12 +85,8 @@ def convert_decimals(obj):
 
 
 def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str) -> dict:
-    """
-    Upload file bytes to Cloudinary.
-    Returns the full Cloudinary response dict (secure_url, public_id, etc.)
-    """
     public_id = f"taxflow/{business_id}/{uuid.uuid4()}"
-    return cloudinary.uploader.upload(
+    result = cloudinary.uploader.upload(
         file_bytes,
         public_id=public_id,
         resource_type="auto",
@@ -98,7 +94,14 @@ def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str) -> 
         access_mode="public",
         type="upload",
     )
-
+    # TEMPORARY DEBUG — remove after fix
+    logger.info(
+        "CLOUDINARY_DEBUG: secure_url=%s resource_type=%s url_type=%s",
+        result["secure_url"],
+        result["resource_type"],
+        result["type"],
+    )
+    return result
 
 def delete_from_cloudinary(public_id: str, resource_type: str = "image") -> None:
     try:
@@ -687,3 +690,11 @@ async def delete_document(
         await db.rollback()
         logger.error("Failed to delete document %s: %s", document_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+
+
+
+
+
+
