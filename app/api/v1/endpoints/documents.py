@@ -84,25 +84,19 @@ def convert_decimals(obj):
     return obj
 
 
-def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str) -> dict:
+def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str, mime_type: str) -> dict:
+    resource_type = "raw" if mime_type == "application/pdf" else "image"
     public_id = f"taxflow/{business_id}/{uuid.uuid4()}"
-    result = cloudinary.uploader.upload(
+    return cloudinary.uploader.upload(
         file_bytes,
         public_id=public_id,
-        resource_type="auto",
+        resource_type=resource_type,
         overwrite=False,
         access_mode="public",
         type="upload",
     )
-    # TEMPORARY DEBUG — remove after fix
-    logger.info(
-        "CLOUDINARY_DEBUG: secure_url=%s resource_type=%s url_type=%s",
-        result["secure_url"],
-        result["resource_type"],
-        result["type"],
-    )
-    return result
 
+    
 def delete_from_cloudinary(public_id: str, resource_type: str = "image") -> None:
     try:
         cloudinary.uploader.destroy(public_id, resource_type=resource_type)
@@ -483,7 +477,12 @@ async def upload_document(
 
     # ── Upload to Cloudinary ──────────────────────────────────────────────────
     try:
-        cloud_result         = upload_to_cloudinary(file_bytes, file.filename or "document", str(business.id))
+        cloud_result         = upload_to_cloudinary(
+            file_bytes,
+            file.filename or "document",
+            str(business.id),
+            file.content_type
+        ) # type: ignore
         cloudinary_url       = cloud_result["secure_url"]
         cloudinary_public_id = cloud_result["public_id"]
         logger.info("Uploaded to Cloudinary: %s", cloudinary_public_id)
