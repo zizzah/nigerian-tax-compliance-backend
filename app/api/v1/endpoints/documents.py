@@ -71,6 +71,63 @@ async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     return business
 
 
+def _run_ocr_and_extraction_from_bytes(file_bytes: bytes, mime_type: str) -> dict:
+    """For fresh uploads — bytes already in memory, no Cloudinary download needed."""
+    tmp_path = None
+    try:
+        suffix = _ext_from_mimetype(mime_type)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        preprocessor = ImagePreprocessor()
+        preprocessed_image = preprocessor.preprocess(tmp_path)
+
+        ocr = OCRExtractor()
+        ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
+
+        if not ocr_text or len(ocr_text.strip()) < 10:
+            raise ValueError("OCR extracted no meaningful text from document")
+
+        groq = GroqReceiptExtractor()
+        extracted_data = groq.extract_receipt_data(ocr_text=ocr_text)
+
+        if not extracted_data.get("category"):
+            try:
+                line_items = extracted_data.get("line_items", [])
+                description = line_items[0].get("description", "") if line_items else ""
+                extracted_data["category"] = groq.categorize_expense(
+                    description, extracted_data.get("vendor_name", "")
+                )
+            except Exception:
+                extracted_data["category"] = "Other"
+
+        return {
+            "status":         "success",
+            "extracted_data": extracted_data,
+            "ocr_text":       ocr_text,
+            "ocr_confidence": ocr_confidence,
+            "error":          None,
+        }
+
+    except Exception as e:
+        logger.error("OCR/extraction failed: %s", e, exc_info=True)
+        return {
+            "status":         "failed",
+            "extracted_data": {},
+            "ocr_text":       None,
+            "ocr_confidence": None,
+            "error":          str(e)[:500],
+        }
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+
 def convert_decimals(obj):
     """Recursively convert Decimal and date objects for JSON serialization."""
     if isinstance(obj, dict):
@@ -187,13 +244,11 @@ def _run_ocr_and_extraction(cloudinary_url: str, mime_type: str) -> dict:
 
 # ── Background task (called by BackgroundTasks) ───────────────────────────────
 
-async def process_document_background(document_id: uuid.UUID) -> None:
-    """
-    Background task — owns its own DB session so it doesn't share state
-    with the request that spawned it. Never raises — failures are written
-    to the document record.
-    """
-
+async def process_document_background(
+    document_id: uuid.UUID,
+    file_bytes: Optional[bytes] = None,
+    mime_type: Optional[str] = None,
+) -> None:
     async with async_session_factory() as db:
         try:
             result = await db.execute(select(Document).where(Document.id == document_id))
@@ -210,21 +265,29 @@ async def process_document_background(document_id: uuid.UUID) -> None:
             start_time = time.time()
 
             logger.info(
-                "PROCESSING_DEBUG: document_id=%s file_path=%s file_type=%s",
+                "PROCESSING_DEBUG: document_id=%s file_path=%s file_type=%s bytes_passed=%s",
                 document_id,
                 document.file_path,
-                document.file_type
+                document.file_type,
+                file_bytes is not None,
             )
 
-            # Run blocking OCR + Groq in thread pool — does not block event loop
-            result_dict = await asyncio.to_thread(
-                _run_ocr_and_extraction,
-                document.file_path, # type: ignore
-                document.file_type, # type: ignore
-            )
+            if file_bytes and mime_type:
+                result_dict = await asyncio.to_thread(
+                    _run_ocr_and_extraction_from_bytes,
+                    file_bytes,
+                    mime_type,
+                )
+            else:
+                logger.info("No bytes passed — downloading from Cloudinary: %s", document.file_path)
+                result_dict = await asyncio.to_thread(
+                    _run_ocr_and_extraction,
+                    document.file_path, # type: ignore
+                    document.file_type,  # type: ignore
+                )
 
             if result_dict["status"] == "failed":
-                document.status = ProcessingStatus.FAILED # type: ignore
+                document.status = ProcessingStatus.FAILED  # type: ignore
                 document.processing_error = result_dict["error"]
                 document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
                 document.processing_duration_seconds = time.time() - start_time # type: ignore
@@ -245,12 +308,12 @@ async def process_document_background(document_id: uuid.UUID) -> None:
 
             doc_date = extracted.get("document_date")
             if isinstance(doc_date, date):
-                document.document_date = doc_date  # type: ignore
+                document.document_date = doc_date # type: ignore
             elif isinstance(doc_date, str):
                 try:
                     document.document_date = datetime.strptime(doc_date, "%Y-%m-%d").date() # type: ignore
                 except Exception:
-                    document.document_date = None  # type: ignore
+                    document.document_date = None # type: ignore
             else:
                 document.document_date = None  # type: ignore
 
@@ -264,12 +327,12 @@ async def process_document_background(document_id: uuid.UUID) -> None:
             document.category          = extracted.get("category", "Other")
             document.confidence_score  = extracted.get("confidence_score")
             document.requires_review   = extracted.get("requires_review", False)
-            document.ai_extracted_data = convert_decimals(extracted) # type: ignore
-            document.ai_model_used     = "llama-3.3-70b-versatile"  # type: ignore
+            document.ai_extracted_data = convert_decimals(extracted)  # type: ignore
+            document.ai_model_used     = "llama-3.3-70b-versatile" # type: ignore
 
             document.status = ProcessingStatus.COMPLETED  # type: ignore
-            document.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
-            document.processing_duration_seconds = time.time() - start_time  # type: ignore
+            document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
+            document.processing_duration_seconds = time.time() - start_time # type: ignore
 
             await db.commit()
             logger.info(
@@ -284,13 +347,12 @@ async def process_document_background(document_id: uuid.UUID) -> None:
                 result = await db.execute(select(Document).where(Document.id == document_id))
                 doc = result.scalar_one_or_none()
                 if doc:
-                    doc.status = ProcessingStatus.FAILED  # type: ignore
-                    doc.processing_error = str(e)[:500]   # type: ignore
-                    doc.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
+                    doc.status = ProcessingStatus.FAILED # type: ignore
+                    doc.processing_error = str(e)[:500] # type: ignore
+                    doc.processing_completed_at = datetime.now(timezone.utc) # type: ignore
                     await db.commit()
             except Exception:
                 pass
-
 
 # ── IMPORTANT: static routes must come BEFORE /{document_id} ─────────────────
 # If /statistics/summary or /upload are registered after /{document_id},
@@ -520,7 +582,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail="Failed to create document record")
 
     # ── Queue background processing ───────────────────────────────────────────
-    background_tasks.add_task(process_document_background, document.id) # type: ignore
+    background_tasks.add_task(process_document_background, document.id,file_bytes,file.content_type,) # type: ignore
     logger.info("Queued background processing for document: %s", document.id)
 
     return DocumentUploadResponse(
