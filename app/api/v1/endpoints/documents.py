@@ -1,10 +1,12 @@
 """
-Document Processing API Endpoints - CLOUDINARY VERSION
+Document Processing API Endpoints
 Location: app/api/v1/endpoints/documents.py
 
-Files are stored in Cloudinary (not local disk) so they persist
-across Render deploys and work correctly in production.
+Storage  : Cloudinary (persists across Render deploys)
+Processing: FastAPI BackgroundTasks (no QStash dependency)
+AI       : Groq llama-3.3-70b-versatile
 """
+import asyncio
 import math
 import logging
 import uuid
@@ -14,11 +16,11 @@ import urllib.request
 import tempfile
 from datetime import datetime, timezone, date
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import RedirectResponse
-from sqlalchemy.ext.asyncio import AsyncSession  # type: ignore
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func as sqlfunc
 
 import cloudinary
@@ -41,7 +43,7 @@ from app.schemas.document import (
     DocumentUpdate,
     DocumentStatistics,
 )
-from app.services.qstash_client import qstash
+from app.core.database import async_session_factory  # local import avoids circular deps
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,6 @@ cloudinary.config(
 async def get_user_business(db: AsyncSession, user_id: uuid.UUID) -> Business:
     result = await db.execute(select(Business).where(Business.user_id == user_id))
     business = result.scalar_one_or_none()
-
     if not business:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -86,27 +87,20 @@ def convert_decimals(obj):
 def upload_to_cloudinary(file_bytes: bytes, filename: str, business_id: str) -> dict:
     """
     Upload file bytes to Cloudinary.
-
-    Returns a dict with:
-      - public_id   : Cloudinary asset identifier
-      - secure_url  : HTTPS URL to access the file
-      - resource_type
+    Returns the full Cloudinary response dict (secure_url, public_id, etc.)
     """
-    unique_name = f"taxflow/{business_id}/{uuid.uuid4()}"
-
-    result = cloudinary.uploader.upload(
+    public_id = f"taxflow/{business_id}/{uuid.uuid4()}"
+    return cloudinary.uploader.upload(
         file_bytes,
-        public_id=unique_name,
+        public_id=public_id,
         resource_type="auto",
         overwrite=False,
         access_mode="public",
         type="upload",
     )
-    return result
 
 
 def delete_from_cloudinary(public_id: str, resource_type: str = "image") -> None:
-    """Delete a file from Cloudinary by public_id."""
     try:
         cloudinary.uploader.destroy(public_id, resource_type=resource_type)
     except Exception as e:
@@ -114,380 +108,191 @@ def delete_from_cloudinary(public_id: str, resource_type: str = "image") -> None
 
 
 def _ext_from_mimetype(mime: str) -> str:
-    """Return a file extension string for a given MIME type."""
-    mapping = {
+    return {
         "image/png":       ".png",
         "image/jpeg":      ".jpg",
         "image/jpg":       ".jpg",
         "application/pdf": ".pdf",
-    }
-    return mapping.get(mime, ".jpg")
+    }.get(mime, ".jpg")
 
 
-async def process_document_sync(document: Document, db: AsyncSession) -> dict:
+# ── Core processing logic (blocking I/O — runs in thread pool) ────────────────
+
+def _run_ocr_and_extraction(cloudinary_url: str, mime_type: str) -> dict:
     """
-    Process a document synchronously (development mode).
-    Reads the file from Cloudinary URL via OCR, then runs Groq extraction.
+    Download file from Cloudinary, run OCR, run Groq extraction.
+    This is pure blocking I/O — always call via asyncio.to_thread().
 
-    Returns a result dict on success or failure — never re-raises, so the
-    caller's outer exception handler cannot roll back a committed FAILED status.
+    Returns a result dict with keys: status, extracted_data, ocr_text,
+    ocr_confidence, error.
     """
+    tmp_path = None
     try:
-        logger.info("Starting synchronous processing for document: %s", document.id)
-
-        document.status = ProcessingStatus.PROCESSING  # type: ignore
-        document.processing_started_at = datetime.now(timezone.utc)  # type: ignore
-        await db.commit()
-
-        start_time = time.time()
-
-        cloudinary_url = document.file_path
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=_ext_from_mimetype(document.file_type)) as tmp:  # type: ignore
+        suffix = _ext_from_mimetype(mime_type)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
 
-        try:
-            req = urllib.request.Request(
-                cloudinary_url,  # type: ignore
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                with open(tmp_path, "wb") as f:
-                    f.write(resp.read())
+        req = urllib.request.Request(
+            cloudinary_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            with open(tmp_path, "wb") as f:
+                f.write(resp.read())
 
-            # Step 1: Preprocess image
-            logger.info("Step 1: Preprocessing image...")
-            preprocessor = ImagePreprocessor()
-            preprocessed_image = preprocessor.preprocess(tmp_path)
+        preprocessor = ImagePreprocessor()
+        preprocessed_image = preprocessor.preprocess(tmp_path)
 
-            # Step 2: OCR
-            logger.info("Step 2: Running OCR...")
-            ocr = OCRExtractor()
-            ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
+        ocr = OCRExtractor()
+        ocr_text, ocr_confidence = ocr.extract_with_confidence(preprocessed_image)
 
-            document.ocr_raw_text = ocr_text  # type: ignore
-            document.ocr_confidence = ocr_confidence  # type: ignore
-            await db.commit()
+        if not ocr_text or len(ocr_text.strip()) < 10:
+            raise ValueError("OCR extracted no meaningful text from document")
 
-            if not ocr_text or len(ocr_text.strip()) < 10:
-                raise ValueError("OCR extracted no meaningful text from image")
+        groq = GroqReceiptExtractor()
+        extracted_data = groq.extract_receipt_data(ocr_text=ocr_text)
 
-            # Step 3: Groq AI extraction
-            logger.info("Step 3: AI extraction with Groq...")
-            groq = GroqReceiptExtractor()
-            extracted_data = groq.extract_receipt_data(ocr_text=ocr_text)
+        # Auto-categorise if Groq didn't
+        if not extracted_data.get("category"):
+            try:
+                line_items = extracted_data.get("line_items", [])
+                description = line_items[0].get("description", "") if line_items else ""
+                extracted_data["category"] = groq.categorize_expense(
+                    description, extracted_data.get("vendor_name", "")
+                )
+            except Exception:
+                extracted_data["category"] = "Other"
 
-        finally:
+        return {
+            "status":         "success",
+            "extracted_data": extracted_data,
+            "ocr_text":       ocr_text,
+            "ocr_confidence": ocr_confidence,
+            "error":          None,
+        }
+
+    except Exception as e:
+        logger.error("OCR/extraction failed: %s", e, exc_info=True)
+        return {
+            "status":         "failed",
+            "extracted_data": {},
+            "ocr_text":       None,
+            "ocr_confidence": None,
+            "error":          str(e)[:500],
+        }
+    finally:
+        if tmp_path:
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
 
-        # Step 4: Save extracted data
-        logger.info("Step 4: Saving extracted data...")
 
-        document.vendor_name    = extracted_data.get("vendor_name")  # type: ignore
-        document.vendor_tin     = extracted_data.get("vendor_tin")  # type: ignore
-        document.vendor_address = extracted_data.get("vendor_address")  # type: ignore
-        document.vendor_phone   = extracted_data.get("vendor_phone")  # type: ignore
-        document.document_number = extracted_data.get("document_number")  # type: ignore
+# ── Background task (called by BackgroundTasks) ───────────────────────────────
 
-        doc_date = extracted_data.get("document_date")
-        if doc_date:
+async def process_document_background(document_id: uuid.UUID) -> None:
+    """
+    Background task — owns its own DB session so it doesn't share state
+    with the request that spawned it. Never raises — failures are written
+    to the document record.
+    """
+
+    async with async_session_factory() as db:
+        try:
+            result = await db.execute(select(Document).where(Document.id == document_id))
+            document = result.scalar_one_or_none()
+
+            if not document:
+                logger.error("Background task: document %s not found", document_id)
+                return
+
+            document.status = ProcessingStatus.PROCESSING # type: ignore
+            document.processing_started_at = datetime.now(timezone.utc) # type: ignore
+            await db.commit()
+
+            start_time = time.time()
+
+            # Run blocking OCR + Groq in thread pool — does not block event loop
+            result_dict = await asyncio.to_thread(
+                _run_ocr_and_extraction,
+                document.file_path, # type: ignore
+                document.file_type, # type: ignore
+            )
+
+            if result_dict["status"] == "failed":
+                document.status = ProcessingStatus.FAILED # type: ignore
+                document.processing_error = result_dict["error"]
+                document.processing_completed_at = datetime.now(timezone.utc) # type: ignore
+                document.processing_duration_seconds = time.time() - start_time # type: ignore
+                await db.commit()
+                logger.error("Document %s processing failed: %s", document_id, result_dict["error"])
+                return
+
+            extracted = result_dict["extracted_data"]
+
+            document.ocr_raw_text   = result_dict["ocr_text"]
+            document.ocr_confidence = result_dict["ocr_confidence"]
+
+            document.vendor_name     = extracted.get("vendor_name")
+            document.vendor_tin      = extracted.get("vendor_tin")
+            document.vendor_address  = extracted.get("vendor_address")
+            document.vendor_phone    = extracted.get("vendor_phone")
+            document.document_number = extracted.get("document_number")
+
+            doc_date = extracted.get("document_date")
             if isinstance(doc_date, date):
                 document.document_date = doc_date  # type: ignore
             elif isinstance(doc_date, str):
                 try:
-                    document.document_date = datetime.strptime(doc_date, "%Y-%m-%d").date()  # type: ignore
+                    document.document_date = datetime.strptime(doc_date, "%Y-%m-%d").date() # type: ignore
                 except Exception:
                     document.document_date = None  # type: ignore
-        else:
-            document.document_date = None  # type: ignore
+            else:
+                document.document_date = None  # type: ignore
 
-        document.line_items        = convert_decimals(extracted_data.get("line_items", []))  # type: ignore
-        document.subtotal          = extracted_data.get("subtotal", 0)  # type: ignore
-        document.vat_amount        = extracted_data.get("vat_amount", 0)  # type: ignore
-        document.total_amount      = extracted_data.get("total_amount", 0)  # type: ignore
-        document.vat_rate          = extracted_data.get("vat_rate", 7.5)  # type: ignore
-        document.payment_method    = extracted_data.get("payment_method")  # type: ignore
-        document.payment_reference = extracted_data.get("payment_reference")  # type: ignore
+            document.line_items        = convert_decimals(extracted.get("line_items", []))  # type: ignore
+            document.subtotal          = extracted.get("subtotal", 0)
+            document.vat_amount        = extracted.get("vat_amount", 0)
+            document.total_amount      = extracted.get("total_amount", 0)
+            document.vat_rate          = extracted.get("vat_rate", 7.5)
+            document.payment_method    = extracted.get("payment_method")
+            document.payment_reference = extracted.get("payment_reference")
+            document.category          = extracted.get("category", "Other")
+            document.confidence_score  = extracted.get("confidence_score")
+            document.requires_review   = extracted.get("requires_review", False)
+            document.ai_extracted_data = convert_decimals(extracted) # type: ignore
+            document.ai_model_used     = "llama-3.3-70b-versatile"  # type: ignore
 
-        if not extracted_data.get("category") and document.vendor_name:  # type: ignore
-            try:
-                line_items  = document.line_items or []
-                description = line_items[0].get("description", "") if line_items else ""  # type: ignore
-                document.category = groq.categorize_expense(description, document.vendor_name)  # type: ignore
-            except Exception:
-                document.category = "Other"  # type: ignore
-        else:
-            document.category = extracted_data.get("category", "Other")
+            document.status = ProcessingStatus.COMPLETED  # type: ignore
+            document.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
+            document.processing_duration_seconds = time.time() - start_time  # type: ignore
 
-        document.confidence_score  = extracted_data.get("confidence_score")  # type: ignore
-        document.requires_review   = extracted_data.get("requires_review", False)
-        document.ai_extracted_data = convert_decimals(extracted_data)  # type: ignore
-        document.ai_model_used     = "llama-3.3-70b-versatile"  # type: ignore
-
-        document.status = ProcessingStatus.COMPLETED  # type: ignore
-        document.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
-        document.processing_duration_seconds = time.time() - start_time  # type: ignore
-
-        await db.commit()
-
-        logger.info(
-            "Processed %s in %.2fs",
-            document.original_filename,
-            document.processing_duration_seconds,
-        )
-
-        return {
-            "status":           "processed",
-            "document_id":      str(document.id),
-            "vendor_name":      document.vendor_name,
-            "total_amount":     float(document.total_amount),
-            "confidence_score": float(document.confidence_score) if document.confidence_score else None,  # type: ignore
-            "processing_time":  float(document.processing_duration_seconds),  # type: ignore
-        }
-
-    except Exception as e:
-        # Fix #4: commit the FAILED status here, then return a failure dict
-        # instead of re-raising. Re-raising would let the caller's outer
-        # except block roll back this commit, leaving the document stuck in
-        # PROCESSING state permanently.
-        logger.error("Synchronous processing failed: %s", e, exc_info=True)
-
-        document.status = ProcessingStatus.FAILED  # type: ignore
-        document.processing_error = str(e)[:500]  # type: ignore
-        document.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
-
-        if document.processing_started_at:  # type: ignore
-            document.processing_duration_seconds = (
-                datetime.now(timezone.utc) - document.processing_started_at
-            ).total_seconds()
-
-        await db.commit()
-
-        return {
-            "status":      "failed",
-            "document_id": str(document.id),
-            "error":       str(e)[:500],
-        }
-
-
-# ── Upload endpoint ───────────────────────────────────────────────────────────
-
-@router.post("/upload", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_document(
-    file: UploadFile = File(...),
-    document_type: str = Form(default="RECEIPT"),
-    notes: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Upload receipt/document for AI processing.
-
-    Files are stored in Cloudinary — they persist across Render deploys.
-    Processing: ~10-15 seconds with Groq AI.
-    Supported: PNG, JPG, PDF (max 10 MB).
-    """
-    try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
-
-        # ── Validate MIME type ────────────────────────────────────────────────
-        allowed_types = ["image/png", "image/jpeg", "image/jpg", "application/pdf"]
-        if file.content_type not in allowed_types:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid file type: {file.content_type}. Allowed: PNG, JPG, PDF",
-            )
-
-        # ── Read & size-check ─────────────────────────────────────────────────
-        file_bytes = await file.read()
-        file_size  = len(file_bytes)
-
-        if file_size > 10 * 1024 * 1024:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File too large: {file_size / (1024*1024):.1f} MB (max 10 MB)",
-            )
-
-        if file_size == 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Uploaded file is empty.",
-            )
-
-        # ── Upload to Cloudinary ──────────────────────────────────────────────
-        try:
-            cloud_result = upload_to_cloudinary(
-                file_bytes,
-                filename=file.filename or "document",
-                business_id=str(business.id),
-            )
-            cloudinary_url       = cloud_result["secure_url"]
-            cloudinary_public_id = cloud_result["public_id"]
-            logger.info("Uploaded to Cloudinary: %s", cloudinary_public_id)
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error("Cloudinary upload failed: %s", e, exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="File upload to Cloudinary failed",
-            )
-
-        # ── Create DB record ──────────────────────────────────────────────────
-        try:
-            document = Document(
-                business_id=business.id,
-                document_type=DocumentType(document_type),
-                original_filename=file.filename or "unknown",
-                file_path=cloudinary_url,
-                file_size=file_size,
-                file_type=file.content_type,
-                status=ProcessingStatus.PENDING,
-                notes=notes,
-            )
-            document.review_notes = cloudinary_public_id  # type: ignore
-
-            db.add(document)
             await db.commit()
-            await db.refresh(document)
-            logger.info("Document record created: %s", document.id)
+            logger.info(
+                "Document %s processed in %.2fs",
+                document_id,
+                document.processing_duration_seconds,
+            )
 
         except Exception as e:
+            logger.error("Background task crashed for document %s: %s", document_id, e, exc_info=True)
             try:
-                cloudinary.uploader.destroy(cloudinary_public_id, resource_type="auto")
+                result = await db.execute(select(Document).where(Document.id == document_id))
+                doc = result.scalar_one_or_none()
+                if doc:
+                    doc.status = ProcessingStatus.FAILED  # type: ignore
+                    doc.processing_error = str(e)[:500]   # type: ignore
+                    doc.processing_completed_at = datetime.now(timezone.utc)  # type: ignore
+                    await db.commit()
             except Exception:
                 pass
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create document record",
-            )
-
-        # ── Process (sync dev / async prod) ──────────────────────────────────
-        try:
-            is_development = settings.ENVIRONMENT.lower() == "development"
-
-            if is_development:
-                logger.info("Development mode: processing synchronously...")
-                # process_document_sync never re-raises — it returns a result dict.
-                # Check the returned status to surface processing failures to the caller.
-                result = await process_document_sync(document, db)
-                if result["status"] == "failed":
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=f"Document uploaded but processing failed: {result['error']}",
-                    )
-                return {
-                    "document_id":                  document.id,
-                    "status":                       document.status,
-                    "message":                      "Document processed successfully",
-                    "estimated_completion_seconds": 0,
-                }
-
-            else:
-                logger.info("Production mode: queuing with QStash...")
-                base_url = getattr(settings, "RENDER_EXTERNAL_URL", None)
-                if not base_url:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="RENDER_EXTERNAL_URL not configured",
-                    )
-
-                callback_url = f"{base_url}/api/v1/background/process-document"
-                response = qstash.publish(
-                    url=callback_url,
-                    body={"document_id": str(document.id), "business_id": str(business.id)},
-                    delay=0,
-                    retries=3,
-                )
-                task_id = response.get("messageId", "unknown")
-                logger.info("Queued document %s, QStash message: %s", document.id, task_id)
-
-                return {
-                    "document_id":                  document.id,
-                    "task_id":                      task_id,
-                    "status":                       document.status,
-                    "message":                      "Document uploaded. AI processing started.",
-                    "estimated_completion_seconds": 15,
-                }
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error("Failed to queue/process document: %s", e, exc_info=True)
-            document.status = ProcessingStatus.FAILED  # type: ignore
-            document.processing_error = f"Failed to queue: {str(e)}"  # type: ignore
-            await db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Document uploaded but processing failed: {str(e)}",
-            )
-
-    except HTTPException:
-        await db.rollback()
-        raise
-    except Exception as e:
-        await db.rollback()
-        logger.error("Failed to upload document: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# ── GET /documents/ ───────────────────────────────────────────────────────────
-
-@router.get("/", response_model=DocumentListResponse)
-async def list_documents(
-    document_type: Optional[DocumentType] = None,
-    status: Optional[ProcessingStatus] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
-
-        query = select(Document).where(Document.business_id == business.id)
-
-        if document_type:
-            query = query.where(Document.document_type == document_type)
-        if status:
-            query = query.where(Document.status == status)
-
-        total_result = await db.execute(
-            select(sqlfunc.count()).select_from(query.subquery())
-        )
-        total = total_result.scalar_one()
-
-        documents_result = await db.execute(
-            query.order_by(Document.created_at.desc()).offset(skip).limit(limit)
-        )
-        documents = documents_result.scalars().all()
-
-        return {
-            "total":       total,
-            "documents":   documents,
-            "skip":        skip,
-            "limit":       limit,
-            "has_more":    skip + limit < total,
-            "page":        (skip // limit) + 1 if limit > 0 else 1,
-            "page_size":   len(documents),
-            "total_page":  math.ceil(total / limit) if limit > 0 else 0,
-        }
-
-    except HTTPException:
-        await db.rollback()
-        raise
-    except Exception as e:
-        await db.rollback()
-        logger.error("Failed to list documents: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
+# ── IMPORTANT: static routes must come BEFORE /{document_id} ─────────────────
+# If /statistics/summary or /upload are registered after /{document_id},
+# FastAPI tries to parse "statistics" or "upload" as a UUID and returns 422.
 
 # ── GET /documents/statistics/summary ────────────────────────────────────────
-# Fix #1: registered BEFORE /{document_id} so FastAPI does not swallow this
-# path as a UUID parameter match (document_id = "statistics" → 422).
 
 @router.get("/statistics/summary", response_model=DocumentStatistics)
 async def get_document_statistics(
@@ -495,7 +300,7 @@ async def get_document_statistics(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         bid = business.id
 
         status_result = await db.execute(
@@ -503,10 +308,9 @@ async def get_document_statistics(
             .where(Document.business_id == bid)
             .group_by(Document.status)
         )
-        status_rows = status_result.all()
         by_status: dict = {
             (s.value if hasattr(s, "value") else str(s)): cnt
-            for s, cnt in status_rows
+            for s, cnt in status_result.all()
         }
 
         total_documents    = sum(by_status.values())
@@ -516,15 +320,15 @@ async def get_document_statistics(
 
         req = await db.execute(
             select(sqlfunc.count(Document.id))
-            .where(Document.business_id == bid, Document.requires_review == True)
+            .where(Document.business_id == bid, Document.requires_review == True)  # noqa: E712
         )
-        requires_review = req.scalar_one_or_none()
+        requires_review = req.scalar_one_or_none() or 0
 
-        total = await db.execute(
+        total_amt = await db.execute(
             select(sqlfunc.coalesce(sqlfunc.sum(Document.total_amount), 0))
             .where(Document.business_id == bid, Document.status == ProcessingStatus.COMPLETED)
         )
-        total_amount_processed = total.scalar_one_or_none() or Decimal("0")
+        total_amount_processed = Decimal(str(total_amt.scalar_one_or_none() or 0))
 
         avg = await db.execute(
             select(sqlfunc.avg(Document.confidence_score))
@@ -543,10 +347,9 @@ async def get_document_statistics(
             .where(Document.business_id == bid)
             .group_by(Document.document_type)
         )
-        type_rows = types.all()
         by_type: dict = {
             (t.value if hasattr(t, "value") else str(t)): cnt
-            for t, cnt in type_rows
+            for t, cnt in types.all()
         }
 
         cat = await db.execute(
@@ -554,8 +357,7 @@ async def get_document_statistics(
             .where(Document.business_id == bid, Document.category.isnot(None))
             .group_by(Document.category)
         )
-        cat_rows = cat.all()
-        by_category: dict = {(c or "Unknown"): cnt for c, cnt in cat_rows}
+        by_category: dict = {(c or "Unknown"): cnt for c, cnt in cat.all()}
 
         return {
             "total_documents":          total_documents,
@@ -563,7 +365,7 @@ async def get_document_statistics(
             "completed":                completed,
             "failed":                   failed,
             "requires_review":          requires_review,
-            "total_amount_processed":   Decimal(str(total_amount_processed)),
+            "total_amount_processed":   total_amount_processed,
             "average_confidence_score": float(avg_confidence) if avg_confidence else None,
             "average_processing_time":  float(avg_processing_time) if avg_processing_time else None,
             "by_type":                  by_type,
@@ -572,12 +374,152 @@ async def get_document_statistics(
         }
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
         logger.error("Failed to get document statistics: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ── GET /documents/ ───────────────────────────────────────────────────────────
+
+@router.get("/", response_model=DocumentListResponse)
+async def list_documents(
+    document_type: Optional[DocumentType] = None,
+    status: Optional[ProcessingStatus] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        business = await get_user_business(db, current_user.id) # type: ignore
+
+        query = select(Document).where(Document.business_id == business.id)
+
+        if document_type:
+            query = query.where(Document.document_type == document_type)
+        if status:
+            query = query.where(Document.status == status)
+
+        total_result = await db.execute(
+            select(sqlfunc.count()).select_from(query.subquery())
+        )
+        total = total_result.scalar_one()
+
+        documents_result = await db.execute(
+            query.order_by(Document.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        documents = documents_result.scalars().all()
+
+        return DocumentListResponse(
+            documents=documents,  # type: ignore
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=math.ceil(total / page_size) if total > 0 else 1,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("Failed to list documents: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ── POST /documents/upload ────────────────────────────────────────────────────
+
+@router.post("/upload", response_model=DocumentUploadResponse, status_code=status.HTTP_201_CREATED)
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    document_type: str = Form(default="RECEIPT"),
+    notes: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload a receipt/document for AI processing.
+
+    The file is stored in Cloudinary immediately. OCR + Groq extraction
+    runs in the background — poll GET /documents/{id} for status.
+
+    Supported: PNG, JPG, PDF (max 10 MB).
+    """
+    business = await get_user_business(db, current_user.id) # type: ignore
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    allowed_types = {"image/png", "image/jpeg", "image/jpg", "application/pdf"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type: {file.content_type}. Allowed: PNG, JPG, PDF",
+        )
+
+    file_bytes = await file.read()
+    file_size  = len(file_bytes)
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    if file_size > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large: {file_size / (1024*1024):.1f} MB (max 10 MB)",
+        )
+
+    # ── Upload to Cloudinary ──────────────────────────────────────────────────
+    try:
+        cloud_result         = upload_to_cloudinary(file_bytes, file.filename or "document", str(business.id))
+        cloudinary_url       = cloud_result["secure_url"]
+        cloudinary_public_id = cloud_result["public_id"]
+        logger.info("Uploaded to Cloudinary: %s", cloudinary_public_id)
+    except Exception as e:
+        logger.error("Cloudinary upload failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="File upload to Cloudinary failed")
+
+    # ── Create DB record ──────────────────────────────────────────────────────
+    try:
+        document = Document(
+            business_id=business.id,
+            document_type=DocumentType(document_type),
+            original_filename=file.filename or "unknown",
+            file_path=cloudinary_url,          # Cloudinary HTTPS URL
+            file_size=file_size,
+            file_type=file.content_type,
+            status=ProcessingStatus.PENDING,
+            notes=notes,
+            # Store public_id for deletion later — review_notes is a dedicated
+            # text field; use it until a cloudinary_public_id column is added.
+            review_notes=cloudinary_public_id,
+        )
+        db.add(document)
+        await db.commit()
+        await db.refresh(document)
+        logger.info("Document record created: %s", document.id)
+
+    except Exception as e:
+        # Clean up Cloudinary asset if DB write fails
+        try:
+            cloudinary.uploader.destroy(cloudinary_public_id, resource_type="auto")
+        except Exception:
+            pass
+        logger.error("DB write failed after Cloudinary upload: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create document record")
+
+    # ── Queue background processing ───────────────────────────────────────────
+    background_tasks.add_task(process_document_background, document.id) # type: ignore
+    logger.info("Queued background processing for document: %s", document.id)
+
+    return DocumentUploadResponse(
+        document_id=document.id, # type: ignore
+        status=document.status,  # type: ignore
+        message="Document uploaded. AI processing started in background.",
+        estimated_completion_seconds=15,
+    )
 
 
 # ── GET /documents/{id} ───────────────────────────────────────────────────────
@@ -596,11 +538,10 @@ async def get_document(
         ))
         document = result.scalar_one_or_none()
         if not document:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+            raise HTTPException(status_code=404, detail="Document not found")
         return document
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -623,14 +564,11 @@ async def download_document(
             Document.business_id == business.id,
         ))
         document = result.scalar_one_or_none()
-
         if not document:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-
+            raise HTTPException(status_code=404, detail="Document not found")
         return RedirectResponse(url=document.file_path, status_code=302)  # type: ignore
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -643,6 +581,7 @@ async def download_document(
 @router.post("/{document_id}/reprocess", response_model=DocumentUploadResponse)
 async def reprocess_document(
     document_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -654,10 +593,9 @@ async def reprocess_document(
         ))
         document = result.scalar_one_or_none()
         if not document:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+            raise HTTPException(status_code=404, detail="Document not found")
 
-        # Reset status
-        document.status                      = ProcessingStatus.PENDING  # type: ignore
+        document.status                      = ProcessingStatus.PENDING # type: ignore
         document.processing_error            = None  # type: ignore
         document.processing_completed_at     = None  # type: ignore
         document.processing_started_at       = None  # type: ignore
@@ -665,45 +603,17 @@ async def reprocess_document(
         document.ocr_raw_text                = None  # type: ignore
         await db.commit()
 
-        is_development = settings.ENVIRONMENT.lower() == "development"
+        background_tasks.add_task(process_document_background, document.id) # type: ignore
+        logger.info("Requeued background processing for document: %s", document.id)
 
-        if is_development:
-            proc_result  = await process_document_sync(document, db)
-            if proc_result ["status"] == "failed":
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Reprocessing failed: {proc_result ['error']}",
-                )
-            return {
-                "document_id":                  document.id,
-                "status":                       document.status,
-                "message":                      "Document reprocessed successfully",
-                "estimated_completion_seconds": 0,
-            }
-        else:
-            base_url = getattr(settings, "RENDER_EXTERNAL_URL", None)
-            if not base_url:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="RENDER_EXTERNAL_URL not configured",
-                )
-            callback_url = f"{base_url}/api/v1/background/process-document"
-            response = qstash.publish(
-                url=callback_url,
-                body={"document_id": str(document.id), "business_id": str(business.id)},
-                delay=0,
-                retries=3,
-            )
-            return {
-                "document_id":                  document.id,
-                "task_id":                      response.get("messageId", "unknown"),
-                "status":                       document.status,
-                "message":                      "Document requeued for AI processing.",
-                "estimated_completion_seconds": 15,
-            }
+        return DocumentUploadResponse(  # type: ignore
+            document_id=document.id,  # type: ignore
+            status=document.status, # type: ignore
+            message="Document requeued for AI processing.",
+            estimated_completion_seconds=15,
+        )
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -711,7 +621,7 @@ async def reprocess_document(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# ── PATCH /documents/{id} ─────────────────────────────────────────────────────
+# ── PATCH /documents/{id} ────────────────────────────────────────────────────
 
 @router.patch("/{document_id}", response_model=DocumentResponse)
 async def update_document(
@@ -721,16 +631,15 @@ async def update_document(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
+        business = await get_user_business(db, current_user.id) # type: ignore
         result = await db.execute(select(Document).where(
             Document.id == document_id,
             Document.business_id == business.id,
         ))
         document = result.scalar_one_or_none()
         if not document:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+            raise HTTPException(status_code=404, detail="Document not found")
 
-        # Fix #2: .dict() is deprecated in Pydantic v2 — use .model_dump()
         for field, value in update_data.model_dump(exclude_unset=True).items():
             setattr(document, field, value)
 
@@ -739,7 +648,6 @@ async def update_document(
         return document
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
@@ -747,7 +655,7 @@ async def update_document(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# ── DELETE /documents/{id} ────────────────────────────────────────────────────
+# ── DELETE /documents/{id} ───────────────────────────────────────────────────
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
@@ -756,25 +664,24 @@ async def delete_document(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        business = await get_user_business(db, current_user.id)  # type: ignore
-
+        business = await get_user_business(db, current_user.id) # type: ignore
         result = await db.execute(select(Document).where(
             Document.id == document_id,
             Document.business_id == business.id,
         ))
         document = result.scalar_one_or_none()
         if not document:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+            raise HTTPException(status_code=404, detail="Document not found")
 
-        if document.review_notes:  # type: ignore
-            delete_from_cloudinary(document.review_notes, resource_type="auto")  # type: ignore
+        # review_notes stores cloudinary_public_id (see upload endpoint comment)
+        if document.review_notes: # type: ignore
+            delete_from_cloudinary(document.review_notes, resource_type="auto") # type: ignore
 
         await db.delete(document)
         await db.commit()
         return None
 
     except HTTPException:
-        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
