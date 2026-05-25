@@ -215,6 +215,13 @@ async def process_document_background(document_id: uuid.UUID) -> None:
 
             start_time = time.time()
 
+            logger.info(
+                "PROCESSING_DEBUG: document_id=%s file_path=%s file_type=%s",
+                document_id,
+                document.file_path,
+                document.file_type
+            )
+
             # Run blocking OCR + Groq in thread pool — does not block event loop
             result_dict = await asyncio.to_thread(
                 _run_ocr_and_extraction,
