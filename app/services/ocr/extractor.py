@@ -10,6 +10,13 @@ import numpy as np
 from typing import Dict, List, Optional
 import logging
 
+import pytesseract
+
+# Windows requires explicit path — no-op on Linux (Render)
+import os
+if os.name == 'nt':
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
 logger = logging.getLogger(__name__)
 
 

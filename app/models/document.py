@@ -67,9 +67,9 @@ class Document(Base):
     
     # Extracted Financial Data
     vendor_name = Column(String(255), nullable=True)
-    vendor_tin = Column(String(20), nullable=True)
+    vendor_tin  = Column(String(50),  nullable=True)  # was 20
     vendor_address = Column(Text, nullable=True)
-    vendor_phone = Column(String(20), nullable=True)
+    vendor_phone = Column(String(50), nullable=True)  # was 20
     
     # Line items stored as JSONB for flexibility
     line_items = Column(JSONB, nullable=True)  

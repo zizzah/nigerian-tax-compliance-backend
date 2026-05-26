@@ -54,7 +54,8 @@ class Settings(BaseSettings):
     # ====================================================================
     QSTASH_TOKEN: str
     QSTASH_CURRENT_SIGNING_KEY: str
-    QSTASH_NEXT_SIGNING_KEY: str
+    QSTASH_NEXT_SIGNING_KEY: str=""
+
     
     # Render deployment URL (set this in Render dashboard)
     RENDER_EXTERNAL_URL: Optional[str] = None
