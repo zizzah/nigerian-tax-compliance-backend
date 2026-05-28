@@ -162,3 +162,69 @@ class DocumentBatchUploadResponse(BaseModel):
     document_ids: List[uuid.UUID]
     task_ids: List[str]
     message: str
+
+
+
+class TransactionSchema(BaseModel):
+    """Single bank transaction (inflow or outflow)"""
+    date: str                        # "2026-03-22"
+    description: str
+    amount: Decimal
+    value_date: Optional[str] = None
+    balance: Optional[Decimal] = None
+ 
+    class Config:
+        from_attributes = True
+ 
+ 
+class BankStatementResponse(BaseModel):
+    """
+    Response schema for bank statement documents.
+    Extends DocumentResponse with bank-specific fields.
+    """
+    id: str
+    business_id: str
+    document_type: str
+    original_filename: str
+    file_path: str
+    status: str
+ 
+    # Account info (extracted from statement header)
+    account_name: Optional[str] = None      # stored in vendor_name
+    account_number: Optional[str] = None    # stored in document_number
+    bank_name: Optional[str] = None         # stored in vendor_name prefix
+ 
+    # Period
+    period_from: Optional[date] = None      # stored in document_date
+    period_to: Optional[date] = None
+ 
+    # Balances
+    opening_balance: Optional[Decimal] = None
+    closing_balance: Optional[Decimal] = None
+    total_inflow: Optional[Decimal] = None
+    total_outflow: Optional[Decimal] = None
+ 
+    # Transactions
+    inflow_transactions:  Optional[List[TransactionSchema]] = None
+    outflow_transactions: Optional[List[TransactionSchema]] = None
+ 
+    # Processing
+    confidence_score: Optional[Decimal] = None
+    processing_error: Optional[str] = None
+    ai_model_used: Optional[str] = None
+ 
+    class Config:
+        from_attributes = True
+ 
+
+
+
+
+
+
+
+
+
+
+
+
