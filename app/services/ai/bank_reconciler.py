@@ -1,15 +1,12 @@
 """
 Bank Statement Reconciliation Service
 Location: app/services/ai/bank_reconciler.py
-
-Parses bank statement text (CSV / TXT / PDF-extracted), extracts credit
-transactions, and matches them to outstanding invoices using amount + customer
-name fuzzy matching.
 """
 import json
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 
+from rapidfuzz import fuzz
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from groq import Groq
@@ -20,10 +17,12 @@ from app.models.customer import Customer
 
 logger = logging.getLogger(__name__)
 
+_MATCH_THRESHOLD = 40
+
 
 class BankReconciler:
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.client = Groq(api_key=settings.GROQ_API_KEY)
 
     # ── Statement parsing ──────────────────────────────────────────────────────
@@ -32,8 +31,8 @@ class BankReconciler:
         """
         Extract credit transactions from raw bank statement text using Groq.
 
-        Returns a list of dicts:
-          [{date, description, amount, reference, type}, ...]
+        Returns:
+            [{date, description, amount, reference, type}, ...]
         """
         prompt = f"""Extract all CREDIT transactions from this Nigerian bank statement.
 
@@ -70,75 +69,48 @@ RULES:
             raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             return json.loads(raw)
         except Exception as e:
-            logger.error(f"Failed to parse bank statement via Groq: {e}")
+            logger.error(f"parse_statement_text failed: {e}")
             return []
 
     # ── Invoice matching ───────────────────────────────────────────────────────
 
     async def match_transactions(
-        self, transactions: List[Dict], business_id: str, db: AsyncSession
+        self,
+        transactions: List[Dict],
+        business_id: str,
+        db: AsyncSession,
     ) -> List[Dict]:
         """
         Match each credit transaction to the most likely outstanding invoice.
 
         Scoring:
-        - Exact amount match (+60), within 2% (+40)
-        - Customer name found in narration (+20 per word, capped)
-        - Invoice number found in narration or reference (+30)
-        Threshold: score ≥ 40 is considered a match.
-        """
+          +60  exact amount match (within ₦1)
+          +40  amount within 2%
+          +20  customer name fuzzy-matches narration (partial_ratio > 70)
+          +30  invoice number found in narration or reference field
 
+        A score >= 40 is treated as a match.
+        """
         stmt = (
             select(Invoice, Customer.name.label("customer_name"))
             .join(Customer, Invoice.customer_id == Customer.id, isouter=True)
             .where(
                 Invoice.business_id == business_id,
-                Invoice.status.in_([  # type: ignore
+                Invoice.status.in_([ # type: ignore
                     InvoiceStatus.SENT,
                     InvoiceStatus.OVERDUE,
                     InvoiceStatus.PARTIALLY_PAID,
                 ]),
             )
         )
-
         result = await db.execute(stmt)
         outstanding = result.all()
 
         results = []
         for txn in transactions:
-            txn_amount = float(txn.get("amount", 0))
-            txn_desc = (txn.get("description") or "").lower()
-            txn_ref = (txn.get("reference") or "").lower()
-
-            best_match = None
-            best_score = 0
-
-            for inv, customer_name in outstanding:
-                inv_amount = float(inv.outstanding_amount or 0)
-                score = 0
-
-                # Amount matching
-                if abs(txn_amount - inv_amount) < 1:
-                    score += 60
-                elif inv_amount > 0 and abs(txn_amount - inv_amount) / inv_amount < 0.02:
-                    score += 40
-
-                # Customer name in narration
-                if customer_name:
-                    for word in customer_name.lower().split():
-                        if len(word) > 3 and word in txn_desc:
-                            score += 20
-                            break
-
-                # Invoice number in narration or reference
-                inv_num = (inv.invoice_number or "").lower()
-                if inv_num and (inv_num in txn_desc or inv_num in txn_ref):
-                    score += 30
-
-                if score > best_score and score >= 40:
-                    best_score = score
-                    best_match = (inv, customer_name)
-
+            best_match, best_score = self._score_against_invoices(
+                txn, outstanding # type: ignore
+            )
             results.append({
                 "transaction": txn,
                 "matched": best_match is not None,
@@ -150,3 +122,50 @@ RULES:
             })
 
         return results
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _score_against_invoices(
+        self,
+        txn: Dict,
+        outstanding: List[Tuple],
+    ) -> Tuple[Optional[Tuple], int]:
+        """
+        Score one transaction against all outstanding invoices.
+        Returns (best_match_tuple | None, best_score).
+        """
+        txn_amount = float(txn.get("amount", 0))
+        txn_desc = (txn.get("description") or "").lower()
+        txn_ref = (txn.get("reference") or "").lower()
+
+        best_match = None
+        best_score = 0
+
+        for inv, customer_name in outstanding:
+            score = 0
+            inv_amount = float(inv.outstanding_amount or 0)
+
+            # ── Amount ────────────────────────────────────────────────────────
+            if abs(txn_amount - inv_amount) < 1:
+                score += 60
+            elif inv_amount > 0 and abs(txn_amount - inv_amount) / inv_amount < 0.02:
+                score += 40
+
+            # ── Customer name fuzzy match ──────────────────────────────────────
+            # partial_ratio handles abbreviations, missing words, and short names
+            # like UBA, GTB, OPay without any length-filtering games.
+            if customer_name:
+                ratio = fuzz.partial_ratio(customer_name.lower(), txn_desc)
+                if ratio > 70:
+                    score += 20
+
+            # ── Invoice number in narration or reference ───────────────────────
+            inv_num = (inv.invoice_number or "").lower()
+            if inv_num and (inv_num in txn_desc or inv_num in txn_ref):
+                score += 30
+
+            if score > best_score and score >= _MATCH_THRESHOLD:
+                best_score = score
+                best_match = (inv, customer_name)
+
+        return best_match, best_score

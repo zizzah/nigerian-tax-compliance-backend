@@ -18,7 +18,8 @@ from datetime import date, timedelta
 from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL = "https://nigerian-tax-compliance-backend.onrender.com/api/v1"
+BASE_URL = "http://127.0.0.1:8000/api/v1"
+# BASE_URL = "https://nigerian-tax-compliance-backend.onrender.com/api/v1"
 
 # Test credentials — change if you already have an account on the hosted server
 TEST_EMAIL    = f"testuser_{int(time.time())}@taxflow-test.com"
@@ -42,6 +43,8 @@ state: dict = {
     "payment_id":   None,
     "expense_id":   None,
     "document_id":  None,
+    "receipt_id":   None,   # set after background processing completes
+    "statement_id": None,   # set after background processing completes
     "reminder_id":  None,
     "target_year":  date.today().year,
 }
@@ -451,19 +454,45 @@ def test_analytics():
 # 11. DOCUMENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _poll_for_completion(document_id: str, max_wait: int = 30) -> Optional[str]:
+    """
+    Poll GET /documents/receipts/{id} until status is COMPLETED or FAILED.
+    Returns final status string or None on timeout.
+    """
+    for _ in range(max_wait):
+        time.sleep(1)
+        r = get(f"/documents/receipts/{document_id}")
+        if r.status_code == 200:
+            status = r.json().get("status")
+            if status in ("COMPLETED", "FAILED"):
+                return status
+        elif r.status_code == 404:
+            # Receipt row not created yet — still processing
+            pass
+    return None
+
+
 def test_documents():
     section("Documents")
     if not state["token"]:
         skip("all document tests", "no token"); return
 
-    r = get("/documents")
-    p("GET /documents", r.status_code == 200)
-
+    # ── Statistics ────────────────────────────────────────────────────────────
     r = get("/documents/statistics/summary")
     p("GET /documents/statistics/summary", r.status_code == 200,
       f"{r.status_code} {r.text[:100]}")
 
-    # Upload a minimal PNG (1x1 white pixel)
+    # ── List receipts ─────────────────────────────────────────────────────────
+    r = get("/documents/receipts")
+    p("GET /documents/receipts", r.status_code == 200,
+      f"{r.status_code} {r.text[:100]}")
+
+    # ── List bank statements ──────────────────────────────────────────────────
+    r = get("/documents/bank-statements")
+    p("GET /documents/bank-statements", r.status_code == 200,
+      f"{r.status_code} {r.text[:100]}")
+
+    # ── Upload receipt (1x1 white PNG — triggers OCR + Groq extraction) ───────
     import base64, io
     png_b64 = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
@@ -471,25 +500,59 @@ def test_documents():
     )
     png_bytes = base64.b64decode(png_b64)
 
-    upload_response = requests.post(
+    upload_r = requests.post(
         f"{BASE_URL}/documents/upload",
         headers={"Authorization": f"Bearer {state['token']}"},
         files={"file": ("test_receipt.png", io.BytesIO(png_bytes), "image/png")},
         data={"document_type": "RECEIPT", "notes": "automated test"},
         timeout=60,
     )
-    p("POST /documents/upload", upload_response.status_code == 201,
-      f"{upload_response.status_code} {upload_response.text[:100]}")
+    p("POST /documents/upload (RECEIPT)", upload_r.status_code == 201,
+      f"{upload_r.status_code} {upload_r.text[:100]}")
 
-    if upload_response.status_code == 201:
-        state["document_id"] = upload_response.json().get("document_id")
+    if upload_r.status_code == 201:
+        state["document_id"] = upload_r.json().get("document_id")
+        print(f"    → document_id: {state['document_id']} — polling for completion...")
 
+        # Poll until background task finishes (max 30s)
+        final_status = _poll_for_completion(state["document_id"])
+        p(
+            f"  Background processing completed (status={final_status})",
+            final_status in ("COMPLETED", "FAILED"),  # FAILED is ok — 1x1 pixel has no text
+            f"timed out after 30s" if final_status is None else "",
+        )
+
+    # ── GET /documents/receipts/{id} ──────────────────────────────────────────
     if state["document_id"]:
-        r = get(f"/documents/{state['document_id']}")
-        p("GET /documents/{id}", r.status_code == 200)
+        r = get(f"/documents/receipts/{state['document_id']}")
+        p("GET /documents/receipts/{id}", r.status_code in (200, 404),
+          f"{r.status_code} {r.text[:100]}")
 
-        r = patch(f"/documents/{state['document_id']}", {"notes": "reviewed"})
-        p("PATCH /documents/{id}", r.status_code == 200)
+        if r.status_code == 200:
+            state["receipt_id"] = state["document_id"]
+            data = r.json()
+            print(f"    → status:      {data.get('status')}")
+            print(f"    → vendor_name: {data.get('vendor_name')}")
+            print(f"    → total_amount:{data.get('total_amount')}")
+            print(f"    → requires_review: {data.get('requires_review')}")
+
+    # ── PATCH /documents/receipts/{id} ────────────────────────────────────────
+    if state["receipt_id"]:
+        r = patch(f"/documents/receipts/{state['receipt_id']}", {
+            "vendor_name": "Manual Override Vendor",
+            "category":    "Office Supplies",
+        })
+        p("PATCH /documents/receipts/{id}", r.status_code == 200,
+          f"{r.status_code} {r.text[:100]}")
+
+    # ── DELETE /documents/{id} (CASCADE deletes receipt row too) ─────────────
+    if state["document_id"]:
+        r = delete(f"/documents/{state['document_id']}")
+        p("DELETE /documents/{id}", r.status_code == 204,
+          f"{r.status_code}")
+        if r.status_code == 204:
+            state["document_id"] = None
+            state["receipt_id"]  = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -636,9 +699,7 @@ def test_cleanup():
         r = delete(f"/products/{state['product_id']}")
         p("DELETE /products/{id}  (soft)", r.status_code == 204)
 
-    if state["document_id"]:
-        r = delete(f"/documents/{state['document_id']}")
-        p("DELETE /documents/{id}", r.status_code == 204)
+    # document cleanup is handled inside test_documents itself
 
 
 # ══════════════════════════════════════════════════════════════════════════════

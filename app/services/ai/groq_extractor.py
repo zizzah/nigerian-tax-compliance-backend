@@ -1,328 +1,91 @@
 """
 AI-Powered Receipt Data Extraction using Groq (llama-3.3-70b-versatile)
 Location: app/services/ai/groq_extractor.py
-
-Groq provides FAST and COST-EFFECTIVE AI inference
-- 10x faster than OpenAI
-- 90% cheaper than Claude
-- Perfect for document processing
 """
-from groq import Groq # type: ignore
-from typing import Dict, Any, Optional, List
+from groq import Groq  # type: ignore
+from typing import Dict, Any, Optional
 import json
+import re
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, date
-import base64
-from pathlib import Path
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Fields that must be Decimal for the Receipt model
+_NUMERIC_FIELDS = ("subtotal", "vat_amount", "total_amount", "vat_rate", "confidence_score")
+
+# Confidence below this triggers human review
+_REVIEW_THRESHOLD = 0.7
+
 
 class GroqReceiptExtractor:
-    """
-    Extract structured data from receipts using Groq's llama-3.3-70b-versatile
-    
-    This is the core AI service that makes the platform intelligent.
-    
-    Why Groq?
-    - Lightning fast inference (10x faster than GPT-4)
-    - Very cost-effective (90% cheaper)
-    - High quality with llama-3.3-70b
-    - Perfect for production document processing
-    """
-    
-    def __init__(self):
-        """Initialize Groq client"""
+
+    def __init__(self) -> None:
         self.client = Groq(api_key=settings.GROQ_API_KEY)
-        self.model = "llama-3.3-70b-versatile"  # Best model for document extraction
-    
-    def extract_receipt_data(
-        self,
-        ocr_text: str,
-        image_path: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self.model  = "llama-3.3-70b-versatile"
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def extract_receipt_data(self, ocr_text: str) -> Dict[str, Any]:
         """
-        Extract structured data from receipt OCR text
-        
-        Note: Groq currently doesn't support vision, so we use OCR text
-        This is actually FASTER and often more accurate!
-        
-        Args:
-            ocr_text: OCR-extracted text from document
-            image_path: Optional path to original image (for future vision support)
-            
-        Returns:
-            Structured receipt data as dictionary
+        Extract structured data from receipt OCR text.
+        Returns a dict shaped for the Receipt model.
+        Raises on unrecoverable failure — caller handles the exception.
         """
-        try:
-            logger.info("Starting Groq AI extraction...")
-            
-            # Build extraction prompt
-            prompt = self._build_extraction_prompt(ocr_text)
-            
-            # Call Groq API
-            start_time = datetime.now()
-            
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert at extracting structured data from Nigerian business receipts and invoices. You always return valid JSON."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.1,  # Low temperature for consistent extraction
-                max_tokens=2000,
-                top_p=1,
-                stream=False
-            )
-            
-            processing_time = (datetime.now() - start_time).total_seconds()
-            logger.info(f"Groq processing completed in {processing_time:.2f} seconds")
-            
-            # Extract response
-            response_text = response.choices[0].message.content
-            
-            # Parse JSON
-            if not response_text:
-                raise ValueError("Groq returned empty response")
-            extracted_data = self._parse_response(response_text)
-            
-            # Validate and clean data
-            validated_data = self._validate_data(extracted_data)
-            
-            # Add metadata
-            validated_data['_meta'] = {
-                'model': self.model,
-                'processing_time_seconds': processing_time,
-                'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') and response.usage is not None else None
-            }
-            
-            logger.info(f"Successfully extracted receipt data: {validated_data.get('vendor_name', 'Unknown')}")
-            
-            return validated_data
-            
-        except Exception as e:
-            logger.error(f"Groq extraction failed: {e}")
-            raise
-    
-    def _build_extraction_prompt(self, ocr_text: str) -> str:
-        """
-        Build comprehensive prompt for Groq
-        
-        This prompt is CRITICAL - it determines extraction quality
-        """
-        prompt = f"""Extract structured data from this Nigerian business receipt/invoice.
+        logger.info("Starting Groq receipt extraction")
+        start = datetime.now()
 
-OCR TEXT:
-```
-{ocr_text[:3000]}  # Limit to avoid token limits
-```
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert at extracting structured data from "
+                        "Nigerian business receipts and invoices. "
+                        "You always return valid JSON with no markdown, no preamble."
+                    ),
+                },
+                {"role": "user", "content": self._build_prompt(ocr_text)},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+            top_p=1,
+            stream=False,
+        )
 
-Extract the following information and return ONLY valid JSON:
+        elapsed = (datetime.now() - start).total_seconds()
+        logger.info("Groq responded in %.2fs", elapsed)
 
-{{
-  "vendor_name": "Business name",
-  "vendor_tin": "Tax Identification Number (if visible)",
-  "vendor_address": "Full address",
-  "vendor_phone": "Phone number",
-  
-  "document_type": "RECEIPT or INVOICE",
-  "document_number": "Receipt/Invoice number",
-  "document_date": "YYYY-MM-DD format",
-  
-  "line_items": [
-    {{
-      "description": "Item description",
-      "quantity": 1.0,
-      "unit_price": 0.00,
-      "amount": 0.00
-    }}
-  ],
-  
-  "subtotal": 0.00,
-  "vat_amount": 0.00,
-  "vat_rate": 7.5,
-  "total_amount": 0.00,
-  
-  "payment_method": "Cash/Card/Transfer/POS/Other",
-  "payment_reference": "Transaction reference if available",
-  
-  "category": "Office Supplies/Utilities/Transportation/Meals/Equipment/Services/Other",
-  "confidence_score": 0.95
-}}
+        raw = response.choices[0].message.content
+        if not raw:
+            raise ValueError("Groq returned an empty response")
 
-CRITICAL INSTRUCTIONS:
+        extracted = self._parse_json(raw)
+        validated = self._validate(extracted)
 
-1. **Nigerian Context:**
-   - VAT rate in Nigeria is 7.5% (use this if not explicitly stated)
-   - Currency is Nigerian Naira (₦)
-   - Common formats: DD/MM/YYYY or DD-MM-YYYY for dates
+        validated["_meta"] = {
+            "model": self.model,
+            "processing_time_seconds": elapsed,
+            "tokens_used": (
+                response.usage.total_tokens
+                if response.usage is not None
+                else None
+            ),
+        }
 
-2. **Number Extraction:**
-   - Extract ALL numeric amounts as numbers (not strings)
-   - Remove currency symbols (₦, N, NGN)
-   - Remove thousand separators (commas)
-   - Examples: "₦450,000.00" → 450000.00, "N 1,200" → 1200.00
-
-3. **Date Formats:**
-   - Convert to YYYY-MM-DD format
-   - Common Nigerian formats: DD/MM/YYYY, DD-MM-YYYY
-
-4. **Line Items:**
-   - Extract each item separately
-   - Calculate amount = quantity × unit_price
-   - If quantity not shown, assume 1
-
-5. **Validation:**
-   - Verify: subtotal + vat_amount ≈ total_amount (within ±1 due to rounding)
-   - If VAT not shown but total suggests it's included, calculate: subtotal × 0.075
-   - If you can't find subtotal, calculate: total_amount / 1.075
-
-6. **Confidence Score:**
-   - Rate your confidence in the extraction (0.0 to 1.0)
-   - Factors: Text clarity, completeness, ambiguity
-   - Be honest - low confidence triggers human review
-   - < 0.7 = requires review
-
-7. **Missing Data:**
-   - Use null for missing fields
-   - Don't make up data
-   - Don't include fields you're unsure about
-
-RETURN ONLY THE JSON OBJECT - NO MARKDOWN, NO EXPLANATIONS, NO PREAMBLE.
-Start with {{ and end with }}"""
-        
-        return prompt
-    
-    def _parse_response(self, response_text: str) -> Dict[str, Any]:
-        """
-        Parse Groq's JSON response
-        
-        Handles markdown code blocks and cleanup
-        """
-        # Remove markdown code blocks if present
-        text = response_text.strip()
-        
-        # Remove various markdown patterns
-        if text.startswith("```json"):
-            text = text[7:]
-        elif text.startswith("```"):
-            text = text[3:]
-        
-        if text.endswith("```"):
-            text = text[:-3]
-        
-        text = text.strip()
-        
-        # Parse JSON
-        try:
-            data = json.loads(text)
-            return data
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing failed: {e}")
-            logger.error(f"Response text: {text[:500]}")
-            
-            # Try to extract JSON from response
-            import re
-            json_match = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                    return data
-                except:
-                    pass
-            
-            raise ValueError("Groq did not return valid JSON")
-    
-    def _validate_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validate and clean extracted data
-        
-        Ensures data integrity before saving to database
-        """
-        validated = data.copy()
-        
-        # Convert date string to date object
-        if validated.get('document_date'):
-            try:
-                date_str = validated['document_date']
-                if isinstance(date_str, str):
-                    validated['document_date'] = datetime.strptime(
-                        date_str, '%Y-%m-%d'
-                    ).date()
-            except Exception as e:
-                logger.warning(f"Date parsing failed: {e}")
-                validated['document_date'] = None
-        
-        # Ensure numeric fields are Decimal
-        numeric_fields = ['subtotal', 'vat_amount', 'total_amount', 'vat_rate', 'confidence_score']
-        for field in numeric_fields:
-            if field in validated and validated[field] is not None:
-                try:
-                    validated[field] = Decimal(str(validated[field]))
-                except:
-                    logger.warning(f"Could not convert {field} to Decimal")
-                    validated[field] = Decimal('0')
-        
-        # Validate line items
-        if validated.get('line_items'):
-            cleaned_items = []
-            for item in validated['line_items']:
-                try:
-                    cleaned_item = {
-                        'description': str(item.get('description', 'Unknown Item')),
-                        'quantity': Decimal(str(item.get('quantity', 1))),
-                        'unit_price': Decimal(str(item.get('unit_price', 0))),
-                        'amount': Decimal(str(item.get('amount', 0)))
-                    }
-                    cleaned_items.append(cleaned_item)
-                except Exception as e:
-                    logger.warning(f"Failed to parse line item: {e}")
-            validated['line_items'] = cleaned_items
-        
-        # Set default confidence score if missing
-        if 'confidence_score' not in validated or validated['confidence_score'] is None:
-            validated['confidence_score'] = Decimal('0.5')
-        
-        # Flag for review if confidence is low
-        confidence = float(validated.get('confidence_score', 0))
-        validated['requires_review'] = confidence < 0.7
-        
-        # Validate financial calculations
-        subtotal = float(validated.get('subtotal', 0))
-        vat = float(validated.get('vat_amount', 0))
-        total = float(validated.get('total_amount', 0))
-        
-        # Check if calculations are consistent (within ±2 for rounding)
-        if abs((subtotal + vat) - total) > 2:
-            logger.warning(f"Financial calculation mismatch: {subtotal} + {vat} ≠ {total}")
-            validated['requires_review'] = True
-        
+        logger.info("Extraction complete — vendor: %s", validated.get("vendor_name", "Unknown"))
         return validated
-    
+
     def categorize_expense(self, description: str, vendor_name: str = "") -> str:
         """
-        Auto-categorize expense based on description and vendor
-        
-        Uses Groq for intelligent categorization
-        
-        Args:
-            description: Item description or transaction description
-            vendor_name: Vendor name (optional)
-            
-        Returns:
-            Category name
+        Categorize a single expense line.
+        Returns 'Other' on any failure — never raises.
         """
-        try:
-            prompt = f"""Categorize this Nigerian business expense into ONE category:
+        prompt = f"""Categorize this Nigerian business expense into ONE category.
 
 Vendor: {vendor_name or 'Unknown'}
 Description: {description}
@@ -343,67 +106,175 @@ Categories:
 - Other
 
 Return ONLY the category name, nothing else."""
-            
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a business expense categorization expert."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=50
-            )
-            
-            category = response.choices[0].message.content
-            if category is None:
-                return "Other"
-            category = category.strip()
-            
-            logger.info(f"Categorized as: {category}")
-            
-            return category
-            
-        except Exception as e:
-            logger.error(f"Categorization failed: {e}")
-            return "Other"
-    
-    def extract_vendor_from_text(self, text: str) -> Optional[str]:
-        """
-        Extract vendor name from text when it's not clearly labeled
-        
-        Args:
-            text: OCR text
-            
-        Returns:
-            Vendor name or None
-        """
+
         try:
-            prompt = f"""Extract the business/vendor name from this receipt text.
-
-Text:
-{text[:500]}
-
-Return ONLY the business name, nothing else. If you can't find it, return "Unknown"."""
-            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": "You are a business expense categorization expert.",
+                    },
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=50
+                max_tokens=50,
             )
-            
-            vendor = response.choices[0].message.content
-            if vendor is None:
-                return None
-            vendor = vendor.strip()
-            
-            if vendor.lower() == "unknown":
-                return None
-            
-            return vendor
-            
+            result = (response.choices[0].message.content or "").strip()
+            return result if result else "Other"
         except Exception as e:
-            logger.error(f"Vendor extraction failed: {e}")
-            return None
+            logger.error("Categorization failed: %s", e)
+            return "Other"
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _build_prompt(self, ocr_text: str) -> str:
+        # Truncate BEFORE the f-string — never put comments inside f-string expressions
+        truncated = ocr_text[:3000]
+
+        return f"""Extract structured data from this Nigerian business receipt/invoice.
+
+OCR TEXT:
+{truncated}
+
+Return ONLY a valid JSON object — no markdown, no explanation, no preamble.
+Start with {{ and end with }}
+
+{{
+  "vendor_name": "Business name or null",
+  "vendor_tin": "Tax Identification Number or null",
+  "vendor_address": "Full address or null",
+  "vendor_phone": "Phone number or null",
+
+  "document_type": "RECEIPT or INVOICE",
+  "document_number": "Receipt/Invoice number or null",
+  "document_date": "YYYY-MM-DD or null",
+
+  "line_items": [
+    {{
+      "description": "Item description",
+      "quantity": 1.0,
+      "unit_price": 0.00,
+      "amount": 0.00
+    }}
+  ],
+
+  "subtotal": 0.00,
+  "vat_amount": 0.00,
+  "vat_rate": 7.5,
+  "total_amount": 0.00,
+
+  "payment_method": "Cash/Card/Transfer/POS/Other or null",
+  "payment_reference": "Transaction reference or null",
+
+  "category": "Office Supplies/Utilities/Transportation/Meals/Equipment/Services/Other",
+  "confidence_score": 0.95
+}}
+
+RULES:
+1. Nigerian VAT rate is 7.5% — use this if not explicitly stated.
+2. All amounts must be plain numbers — no ₦ symbol, no commas.
+   Examples: "₦450,000.00" → 450000.00 | "N 1,200" → 1200.00
+3. Dates must be YYYY-MM-DD. Convert DD/MM/YYYY or DD-MM-YYYY if needed.
+4. line_items: extract each item separately. amount = quantity × unit_price.
+   If quantity is not shown, assume 1.
+5. Verify: subtotal + vat_amount ≈ total_amount (±1 rounding tolerance).
+   If VAT is missing: vat_amount = subtotal × 0.075
+   If subtotal is missing: subtotal = total_amount / 1.075
+6. confidence_score: 0.0–1.0. Be honest — below 0.7 triggers human review.
+7. Use null for any field you cannot find. Do not invent data."""
+
+    def _parse_json(self, text: str) -> Dict[str, Any]:
+        """
+        Strip markdown fences and parse JSON.
+        Falls back to regex extraction if the model wraps output unexpectedly.
+        Raises ValueError if no valid JSON can be found.
+        """
+        cleaned = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # Last resort: find the outermost {...} block
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+
+        logger.error("Could not parse Groq response as JSON. Raw (first 500): %s", text[:500])
+        raise ValueError("Groq did not return valid JSON")
+
+    def _validate(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Clean and validate extracted data for the Receipt model.
+        Never silently zeroes a field without logging — caller must know what happened.
+        """
+        out = data.copy()
+
+        # ── Date ──────────────────────────────────────────────────────────────
+        raw_date = out.get("document_date")
+        if raw_date and isinstance(raw_date, str):
+            parsed = None
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    parsed = datetime.strptime(raw_date, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                logger.warning("Could not parse document_date: %s — setting null", raw_date)
+            out["document_date"] = parsed
+
+        # ── Numeric fields ─────────────────────────────────────────────────────
+        for field in _NUMERIC_FIELDS:
+            value = out.get(field)
+            if value is None:
+                continue
+            try:
+                out[field] = Decimal(str(value))
+            except (InvalidOperation, ValueError) as e:
+                logger.warning("Could not convert %s=%r to Decimal: %s", field, value, e)
+                # confidence_score missing → conservative default that triggers review
+                # financial fields missing → null is safer than 0 (0 hides the gap)
+                out[field] = Decimal("0.5") if field == "confidence_score" else None
+
+        # ── Confidence and review flag ─────────────────────────────────────────
+        if out.get("confidence_score") is None:
+            out["confidence_score"] = Decimal("0.5")
+            logger.warning("confidence_score missing — defaulting to 0.5 (review required)")
+
+        confidence = float(out["confidence_score"])
+        out["requires_review"] = confidence < _REVIEW_THRESHOLD
+
+        # ── Line items ─────────────────────────────────────────────────────────
+        raw_items = out.get("line_items") or []
+        cleaned_items = []
+        for i, item in enumerate(raw_items):
+            try:
+                cleaned_items.append({
+                    "description": str(item.get("description") or "Unknown Item"),
+                    "quantity":    Decimal(str(item.get("quantity")   or 1)),
+                    "unit_price":  Decimal(str(item.get("unit_price") or 0)),
+                    "amount":      Decimal(str(item.get("amount")     or 0)),
+                })
+            except (InvalidOperation, ValueError) as e:
+                logger.warning("Skipping malformed line item %d: %s — %s", i, item, e)
+        out["line_items"] = cleaned_items
+
+        # ── Financial consistency check ────────────────────────────────────────
+        subtotal = float(out.get("subtotal") or 0)
+        vat      = float(out.get("vat_amount") or 0)
+        total    = float(out.get("total_amount") or 0)
+
+        if total > 0 and abs((subtotal + vat) - total) > 2:
+            logger.warning(
+                "Financial mismatch: subtotal %.2f + vat %.2f = %.2f but total_amount is %.2f",
+                subtotal, vat, subtotal + vat, total,
+            )
+            out["requires_review"] = True
+
+        return out

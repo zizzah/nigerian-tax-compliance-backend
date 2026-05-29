@@ -135,9 +135,6 @@ class Settings(BaseSettings):
     VAT_RATE: float = 0.075  # 7.5%
     WHT_RATE: float = 0.05   # 5%
 
-    CLOUDINARY_CLOUD_NAME: str = ""
-    CLOUDINARY_API_KEY: str = ""
-    CLOUDINARY_API_SECRET: str = ""
 
 
     SMTP_HOST:     str  = "smtp.gmail.com"

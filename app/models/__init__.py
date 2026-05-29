@@ -42,6 +42,8 @@ from app.models.sales_target import SalesTarget, split_annual_target
 # AI Insights  ← NEW
 from app.models.ai_insight import AIInsight
 from app.models.bank_reconciliation import BankReconciliation
+from app.models.receipt import Receipt
+from app.models.bank_statement import BankStatement
 
 
 __all__ = [
@@ -76,4 +78,6 @@ __all__ = [
     # AI
     "AIInsight",
     "BankReconciliation",
+    "Receipt",
+    "BankStatement"
 ]

@@ -97,7 +97,7 @@ async def upload_bank_statement(
         raise HTTPException(status_code=422, detail="No credit transactions found.")
 
     # ⚠️ IMPORTANT: keep db passed as-is (no await inside service)
-    matches = reconciler.match_transactions(transactions, str(biz.id), db)
+    matches = await  reconciler.match_transactions(transactions, str(biz.id), db)
 
     matched   = [m for m in matches if m["matched"]] # type: ignore
     unmatched = [m for m in matches if not m["matched"]] # type: ignore

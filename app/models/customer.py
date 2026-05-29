@@ -82,7 +82,7 @@ class Customer(Base):
         result = await db_session.execute(
             select(Invoice).where(
                 Invoice.customer_id == self.id,
-                Invoice.status != InvoiceStatus.CANCELLED
+                Invoice.status != InvoiceStatus.CANCELLED # type: ignore
             )
         )
         invoices = result.scalars().all()
