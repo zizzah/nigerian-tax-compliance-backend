@@ -66,7 +66,6 @@ from app.core.security_middleware import (
 from app.api.v1.endpoints import (
     analytics,
     auth,
-    background,
     businesses,
     customers,
     documents,
@@ -279,7 +278,6 @@ app.include_router(invoices.router,   prefix=settings.API_V1_PREFIX)
 app.include_router(products.router,   prefix=settings.API_V1_PREFIX)
 app.include_router(payments.router,   prefix=settings.API_V1_PREFIX)
 app.include_router(documents.router,  prefix=settings.API_V1_PREFIX)
-app.include_router(background.router, prefix=settings.API_V1_PREFIX)
 app.include_router(analytics.router,  prefix=settings.API_V1_PREFIX)
 app.include_router(reminders.router,  prefix=settings.API_V1_PREFIX)
 app.include_router(paystack.router,   prefix=settings.API_V1_PREFIX)
