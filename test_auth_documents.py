@@ -20,7 +20,7 @@ from datetime import date
 from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL      = "http://127.0.0.1:8000/api/v1"
+BASE_URL = "https://nigerian-tax-compliance-backend.onrender.com/api/v1"
 TEST_EMAIL    = f"testuser_{int(time.time())}@taxflow-test.com"
 TEST_PASSWORD = "TestPass@123"
 
@@ -70,13 +70,13 @@ def skip(label: str, reason: str = ""):
     print(f"  {YELLOW}○{RESET} {label}  {YELLOW}(skipped: {reason}){RESET}")
 
 
-def post(path: str, payload: dict = None, auth: bool = True) -> requests.Response:
+def post(path: str, payload: dict = None, auth: bool = True) -> requests.Response: # type: ignore
     h = auth_headers() if auth else {}
     h["Content-Type"] = "application/json"
     return requests.post(f"{BASE_URL}{path}", json=payload, headers=h, timeout=30)
 
 
-def get(path: str, params: dict = None, auth: bool = True) -> requests.Response:
+def get(path: str, params: dict = None, auth: bool = True) -> requests.Response: # type: ignore
     h = auth_headers() if auth else {}
     return requests.get(f"{BASE_URL}{path}", params=params, headers=h, timeout=30)
 

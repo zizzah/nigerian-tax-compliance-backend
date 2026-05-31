@@ -14,7 +14,7 @@ from app.schemas.document import DocumentType, ProcessingStatus, DocumentBase
 class TransactionSchema(BaseModel):
     """Single credit or debit transaction row."""
     date: date
-    description: str
+    description: str=""
     amount: Decimal
     value_date: Optional[date] = None # type: ignore
     balance: Optional[Decimal] = None

@@ -677,6 +677,42 @@ async def get_document_statistics(
     )
 
 
+@router.post("/debug/pdf-extract")
+async def debug_pdf_extract(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Temporary debug endpoint — remove after investigation."""
+    import tempfile, os
+    import fitz
+
+    file_bytes = await file.read()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(file_bytes)
+    tmp.close()
+
+    try:
+        doc = fitz.open(tmp.name)
+        result = {}
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            words = page.get_text("words")
+            result[f"page_{page_num+1}"] = {
+                "word_count": len(words),
+                "first_50_words": [
+                    {"text": w[4], "x": round(w[0], 1), "y": round(w[1], 1)} # type: ignore
+                    for w in words[:50]
+                ]
+            }
+        doc.close()
+        return result
+    finally:
+        os.unlink(tmp.name)
+
+
+
+
+
 # ── Response builders ─────────────────────────────────────────────────────────
 
 def _merge_receipt_response(receipt: Receipt, document: Document) -> ReceiptResponse:
